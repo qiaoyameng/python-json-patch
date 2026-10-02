@@ -6,6 +6,8 @@ from __future__ import unicode_literals
 import json
 import decimal
 import doctest
+import copy
+import random
 import unittest
 import jsonpatch
 import jsonpointer
@@ -248,6 +250,298 @@ class ApplyPatchTestCase(unittest.TestCase):
         self.assertRaises(jsonpatch.InvalidJsonPatch,
                           jsonpatch.apply_patch,
                           obj, '[{"op": "add", "path": null, "value": "bar"}]')
+
+
+class ApplyWithInverseTestCase(unittest.TestCase):
+
+    def assert_application_roundtrip(self, doc, patch):
+        original = copy.deepcopy(doc)
+        result, inverse = jsonpatch.apply_with_inverse(doc, patch)
+        restored = jsonpatch.apply_patch(result, inverse)
+        self.assertEqual(restored, original)
+        self.assertEqual(doc, original)
+        self.assertIsInstance(inverse, list)
+        return result, inverse
+
+    def test_returns_plain_patch(self):
+        result, inverse = jsonpatch.apply_with_inverse(
+            {'foo': 'bar'},
+            [{'op': 'add', 'path': '/baz', 'value': 'qux'}]
+        )
+        self.assertEqual(result, {'foo': 'bar', 'baz': 'qux'})
+        self.assertEqual(inverse, [
+            {'op': 'remove', 'path': '/baz'}
+        ])
+        self.assertEqual(jsonpatch.apply_patch(result, inverse), {'foo': 'bar'})
+
+    def test_add_object_member_restores_old_value(self):
+        value = {'nested': ['old']}
+        result, inverse = jsonpatch.apply_with_inverse(
+            {'foo': value},
+            [{'op': 'add', 'path': '/foo', 'value': {'nested': ['new']}}]
+        )
+        self.assertEqual(inverse[0], {
+            'op': 'replace',
+            'path': '/foo',
+            'value': {'nested': ['old']},
+        })
+        value['nested'].append('changed')
+        result['foo']['nested'].append('also changed')
+        self.assertEqual(jsonpatch.apply_patch(result, inverse),
+                         {'foo': {'nested': ['old']}})
+
+    def test_array_add_remove_and_dash_use_current_indices(self):
+        doc = {'items': ['a', 'b', 'c']}
+        patch = [
+            {'op': 'add', 'path': '/items/-', 'value': 'd'},
+            {'op': 'remove', 'path': '/items/0'},
+            {'op': 'add', 'path': '/items/1', 'value': 'x'},
+            {'op': 'add', 'path': '/items/1', 'value': 'y'},
+            {'op': 'remove', 'path': '/items/4'},
+        ]
+        result, inverse = self.assert_application_roundtrip(doc, patch)
+        self.assertEqual(result['items'], ['b', 'y', 'x', 'c'])
+        self.assertEqual(inverse, [
+            {'op': 'add', 'path': '/items/4', 'value': 'd'},
+            {'op': 'remove', 'path': '/items/1'},
+            {'op': 'remove', 'path': '/items/1'},
+            {'op': 'add', 'path': '/items/0', 'value': 'a'},
+            {'op': 'remove', 'path': '/items/3'},
+        ])
+
+    def test_move_uses_current_indices_and_target_value(self):
+        doc = {'items': ['a', 'b', 'c', 'd'], 'target': 'old'}
+        patch = [
+            {'op': 'move', 'from': '/items/0', 'path': '/items/3'},
+            {'op': 'move', 'from': '/items/2', 'path': '/target'},
+        ]
+        result, inverse = self.assert_application_roundtrip(doc, patch)
+        self.assertEqual(result, {'items': ['b', 'c', 'a'], 'target': 'd'})
+        self.assertEqual(inverse, [
+            {'op': 'replace', 'path': '/target', 'value': 'old'},
+            {'op': 'add', 'path': '/items/2', 'value': 'd'},
+            {'op': 'remove', 'path': '/items/3'},
+            {'op': 'add', 'path': '/items/0', 'value': 'a'},
+        ])
+
+    def test_copy_followed_by_modification(self):
+        doc = {'source': {'value': ['original']}}
+        patch = [
+            {'op': 'copy', 'from': '/source', 'path': '/copy'},
+            {'op': 'add', 'path': '/copy/value/-', 'value': 'changed'},
+        ]
+        result, inverse = self.assert_application_roundtrip(doc, patch)
+        self.assertEqual(result['source']['value'], ['original'])
+        self.assertEqual(result['copy']['value'], ['original', 'changed'])
+
+    def test_continuous_sequence_uses_every_operation(self):
+        doc = {
+            'items': ['a', 'b', 'c'],
+            'obj': {'old': 0, 'target': 'before'},
+            'target': 'old',
+        }
+        patch = [
+            {'op': 'test', 'path': '/target', 'value': 'old'},
+            {'op': 'add', 'path': '/obj/new', 'value': 1},
+            {'op': 'add', 'path': '/items/-', 'value': 'd'},
+            {'op': 'remove', 'path': '/items/0'},
+            {'op': 'add', 'path': '/items/1', 'value': 'x'},
+            {'op': 'replace', 'path': '/obj/old', 'value': 2},
+            {'op': 'move', 'from': '/items/0', 'path': '/items/-'},
+            {'op': 'move', 'from': '/obj/target', 'path': '/target'},
+            {'op': 'copy', 'from': '/obj', 'path': '/obj_copy'},
+            {'op': 'add', 'path': '/obj_copy/changed', 'value': True},
+            {'op': 'test', 'path': '/obj_copy/old', 'value': 2},
+        ]
+        self.assert_application_roundtrip(doc, patch)
+
+    def test_root_replace(self):
+        doc = {'items': ['a', 'b']}
+        patch = [
+            {'op': 'add', 'path': '/items/-', 'value': 'c'},
+            {'op': 'replace', 'path': '', 'value': [{'root': True}]},
+        ]
+        self.assert_application_roundtrip(doc, patch)
+
+    def test_test_does_not_contribute_inverse_operation(self):
+        result, inverse = jsonpatch.apply_with_inverse(
+            {'foo': 'bar'},
+            [
+                {'op': 'test', 'path': '/foo', 'value': 'bar'},
+                {'op': 'replace', 'path': '/foo', 'value': 'baz'},
+                {'op': 'test', 'path': '/foo', 'value': 'baz'},
+            ]
+        )
+        self.assertEqual(result, {'foo': 'baz'})
+        self.assertEqual(inverse, [
+            {'op': 'replace', 'path': '/foo', 'value': 'bar'},
+        ])
+
+    def test_failed_operation_returns_no_inverse(self):
+        doc = {'foo': ['a']}
+        original = copy.deepcopy(doc)
+        with self.assertRaises(jsonpatch.JsonPatchConflict):
+            jsonpatch.apply_with_inverse(doc, [
+                {'op': 'add', 'path': '/foo/-', 'value': 'b'},
+                {'op': 'remove', 'path': '/missing'},
+            ])
+        self.assertEqual(doc, original)
+
+    def test_inverse_is_isolated_from_patch_and_result(self):
+        old_value = {'nested': ['value']}
+        new_value = {'nested': ['new']}
+        doc = {'foo': old_value}
+        patch = [{'op': 'replace', 'path': '/foo', 'value': new_value}]
+        result, inverse = jsonpatch.apply_with_inverse(doc, patch)
+        old_value['nested'].append('old mutation')
+        new_value['nested'].append('patch mutation')
+        result['foo']['nested'].append('result mutation')
+        self.assertEqual(inverse[0]['value'], {'nested': ['value']})
+
+    def test_random_documents(self):
+        random.seed(1729)
+        for _ in range(50):
+            doc = self._make_document(2)
+            patch = self._make_patch(doc, 24)
+            self.assert_application_roundtrip(doc, patch)
+
+    def _make_value(self, depth):
+        choices = [None, True, False, 0, 1, 'alpha', 'beta', 'z']
+        if depth > 0:
+            choices.extend([
+                [],
+                {},
+                [self._make_value(depth - 1) for _ in range(random.randrange(3))],
+                {str(i): self._make_value(depth - 1)
+                 for i in range(random.randrange(3))},
+            ])
+        return random.choice(choices)
+
+    def _make_document(self, depth):
+        if depth == 0 or random.random() < 0.3:
+            return [self._make_value(depth - 1)
+                    for _ in range(random.randrange(2, 5))]
+        return {
+            chr(ord('a') + index): self._make_value(depth - 1)
+            for index in range(random.randrange(2, 5))
+        }
+
+    def _pointers(self, value, path=''):
+        pointers = [path]
+        if isinstance(value, dict):
+            for key, item in value.items():
+                child_path = path + '/' + key
+                pointers.extend(self._pointers(item, child_path))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                child_path = path + '/' + str(index)
+                pointers.extend(self._pointers(item, child_path))
+        return pointers
+
+    def _non_root_pointers(self, doc):
+        return [path for path in self._pointers(doc) if path]
+
+    def _container_pointers(self, value, path=''):
+        pointers = [(path, value)]
+        if isinstance(value, dict):
+            for key, item in value.items():
+                pointers.extend(
+                    self._container_pointers(item, path + '/' + key)
+                )
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                pointers.extend(
+                    self._container_pointers(item, path + '/' + str(index))
+                )
+        return pointers
+
+    def _target_path(self, container, container_path):
+        if isinstance(container, list):
+            index = random.randrange(len(container) + 1)
+            if container_path:
+                return container_path + '/' + str(index)
+            return '/' + str(index)
+        key = random.choice(['z', 'q', 'm', 'n'])
+        if container_path:
+            return container_path + '/' + key
+        return '/' + key
+
+    def _make_patch(self, doc, operation_count):
+        current = copy.deepcopy(doc)
+        patch = []
+        seen_operations = set()
+        operations = ['add', 'remove', 'replace', 'move', 'copy', 'test']
+
+        for _ in range(operation_count):
+            op = random.choice(operations)
+            operation = self._make_operation(op, current)
+            if operation is None:
+                continue
+
+            trial = copy.deepcopy(current)
+            try:
+                current = jsonpatch.apply_patch(trial, [operation])
+            except (jsonpatch.JsonPatchException, jsonpointer.JsonPointerException):
+                continue
+
+            patch.append(operation)
+            seen_operations.add(op)
+
+        for op in operations:
+            if op not in seen_operations:
+                operation = self._make_operation(op, current)
+                if operation is not None:
+                    trial = copy.deepcopy(current)
+                    try:
+                        current = jsonpatch.apply_patch(trial, [operation])
+                    except (jsonpatch.JsonPatchException, jsonpointer.JsonPointerException):
+                        continue
+                    patch.append(operation)
+
+        return patch
+
+    def _make_operation(self, op, doc):
+        if op == 'add':
+            containers = self._container_pointers(doc)
+            container_path, container = random.choice(containers)
+            return {
+                'op': 'add',
+                'path': self._target_path(container, container_path),
+                'value': self._make_value(1),
+            }
+
+        pointers = self._non_root_pointers(doc)
+        if not pointers:
+            return None
+        path = random.choice(pointers)
+
+        if op == 'remove':
+            return {'op': 'remove', 'path': path}
+
+        if op == 'replace':
+            return {
+                'op': 'replace',
+                'path': path,
+                'value': self._make_value(1),
+            }
+
+        if op == 'test':
+            return {
+                'op': 'test',
+                'path': path,
+                'value': copy.deepcopy(jsonpointer.resolve_pointer(doc, path)),
+            }
+
+        destination_pointers = self._non_root_pointers(doc)
+        from_path = random.choice(destination_pointers)
+        containers = self._container_pointers(doc)
+        container_path, container = random.choice(containers)
+        to_path = self._target_path(container, container_path)
+        return {
+            'op': op,
+            'from': from_path,
+            'path': to_path,
+        }
 
 
 class EqualityTestCase(unittest.TestCase):
@@ -1049,6 +1343,7 @@ if __name__ == '__main__':
         suite = unittest.TestSuite()
         suite.addTest(doctest.DocTestSuite(jsonpatch))
         suite.addTest(unittest.makeSuite(ApplyPatchTestCase))
+        suite.addTest(unittest.makeSuite(ApplyWithInverseTestCase))
         suite.addTest(unittest.makeSuite(EqualityTestCase))
         suite.addTest(unittest.makeSuite(MakePatchTestCase))
         suite.addTest(unittest.makeSuite(ListTests))

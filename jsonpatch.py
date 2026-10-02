@@ -157,6 +157,32 @@ def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer):
     return patch.apply(doc, in_place)
 
 
+def apply_with_inverse(doc, patch, in_place=False, pointer_cls=JsonPointer):
+    """Apply a patch and return the result with its RFC 6902 inverse patch.
+
+    :param doc: Document object.
+    :type doc: dict
+
+    :param patch: JSON patch as list of dicts or raw JSON-encoded string.
+    :type patch: list or str
+
+    :param in_place: When ``False``, apply the patch to a copy of ``doc``.
+    :type in_place: bool
+
+    :param pointer_cls: JSON pointer class to use.
+    :type pointer_cls: Type[JsonPointer]
+
+    :return: Patched document and a list of operations that restores the
+             document passed to the corresponding forward operation.
+    :rtype: tuple
+    """
+    if isinstance(patch, basestring):
+        patch = JsonPatch.from_string(patch, pointer_cls=pointer_cls)
+    else:
+        patch = JsonPatch(patch, pointer_cls=pointer_cls)
+    return patch.apply_with_inverse(doc, in_place)
+
+
 def make_patch(src, dst, pointer_cls=JsonPointer):
     """Generates patch by comparing two document objects. Actually is
     a proxy to :meth:`JsonPatch.from_diff` method.
@@ -206,6 +232,10 @@ class PatchOperation(object):
         """Abstract method that applies a patch operation to the specified object."""
         raise NotImplementedError('should implement the patch operation.')
 
+    def apply_with_inverse(self, obj):
+        """Applies the operation and returns the object and inverse operations."""
+        raise NotImplementedError('should implement the patch operation.')
+
     def __hash__(self):
         return hash(frozenset(self.operation.items()))
 
@@ -252,6 +282,28 @@ class RemoveOperation(PatchOperation):
 
         return obj
 
+    def apply_with_inverse(self, obj):
+        subobj, part = self.pointer.to_last(obj)
+
+        if isinstance(subobj, Sequence) and not isinstance(part, int):
+            raise JsonPointerException("invalid array index '{0}'".format(part))
+
+        if part is None:
+            old_value = copy.deepcopy(obj)
+        else:
+            try:
+                old_value = copy.deepcopy(subobj[part])
+            except (KeyError, IndexError):
+                old_value = None
+
+        obj = self.apply(obj)
+        inverse_path = '' if part is None else self.location
+        return obj, [{
+            'op': 'add',
+            'path': inverse_path,
+            'value': old_value,
+        }]
+
     def _on_undo_remove(self, path, key):
         if self.path == path:
             if self.key >= key:
@@ -281,7 +333,10 @@ class AddOperation(PatchOperation):
 
         subobj, part = self.pointer.to_last(obj)
 
-        if isinstance(subobj, MutableSequence):
+        if part is None:
+            obj = value
+
+        elif isinstance(subobj, MutableSequence):
             if part == '-':
                 subobj.append(value)  # pylint: disable=E1103
 
@@ -292,17 +347,62 @@ class AddOperation(PatchOperation):
                 subobj.insert(part, value)  # pylint: disable=E1103
 
         elif isinstance(subobj, MutableMapping):
-            if part is None:
-                obj = value  # we're replacing the root
-            else:
-                subobj[part] = value
+            subobj[part] = value
 
         else:
-            if part is None:
-                raise TypeError("invalid document type {0}".format(type(subobj)))
-            else:
-                raise JsonPatchConflict("unable to fully resolve json pointer {0}, part {1}".format(self.location, part))
+            raise JsonPatchConflict(
+                "unable to fully resolve json pointer {0}, part {1}".format(
+                    self.location, part))
         return obj
+
+    def apply_with_inverse(self, obj):
+        try:
+            value = self.operation["value"]
+        except KeyError as ex:
+            raise InvalidJsonPatch(
+                "The operation does not contain a 'value' member")
+
+        subobj, part = self.pointer.to_last(obj)
+
+        if part is None:
+            inverse = [{
+                'op': 'replace',
+                'path': '',
+                'value': copy.deepcopy(obj),
+            }]
+
+        elif isinstance(subobj, MutableSequence):
+            if part == '-':
+                parent_parts = self.pointer.parts[:-1]
+                parent_pointer = self.pointer_cls('')
+                parent_pointer.parts = list(parent_parts)
+                inverse_path = _path_join(parent_pointer.path, len(subobj))
+            elif part > len(subobj) or part < 0:
+                return self.apply(obj), []
+            else:
+                inverse_path = self.location
+            inverse = [{
+                'op': 'remove',
+                'path': inverse_path,
+            }]
+
+        elif isinstance(subobj, MutableMapping):
+            if part in subobj:
+                inverse = [{
+                    'op': 'replace',
+                    'path': self.location,
+                    'value': copy.deepcopy(subobj[part]),
+                }]
+            else:
+                inverse = [{
+                    'op': 'remove',
+                    'path': self.location,
+                }]
+
+        else:
+            return self.apply(obj), []
+
+        return self.apply(obj), inverse
 
     def _on_undo_remove(self, path, key):
         if self.path == path:
@@ -356,6 +456,24 @@ class ReplaceOperation(PatchOperation):
         subobj[part] = value
         return obj
 
+    def apply_with_inverse(self, obj):
+        subobj, part = self.pointer.to_last(obj)
+
+        if part is None:
+            old_value = copy.deepcopy(obj)
+        else:
+            try:
+                old_value = copy.deepcopy(subobj[part])
+            except (KeyError, IndexError):
+                old_value = None
+
+        obj = self.apply(obj)
+        return obj, [{
+            'op': 'replace',
+            'path': self.location,
+            'value': old_value,
+        }]
+
     def _on_undo_remove(self, path, key):
         return key
 
@@ -402,6 +520,42 @@ class MoveOperation(PatchOperation):
         }, pointer_cls=self.pointer_cls).apply(obj)
 
         return obj
+
+    def apply_with_inverse(self, obj):
+        try:
+            if isinstance(self.operation['from'], self.pointer_cls):
+                from_ptr = self.operation['from']
+            else:
+                from_ptr = self.pointer_cls(self.operation['from'])
+        except KeyError as ex:
+            raise InvalidJsonPatch(
+                "The operation does not contain a 'from' member")
+
+        subobj, part = from_ptr.to_last(obj)
+        try:
+            value = subobj[part]
+        except (KeyError, IndexError) as ex:
+            raise JsonPatchConflict(str(ex))
+
+        if self.pointer == from_ptr:
+            return obj, []
+
+        if isinstance(subobj, MutableMapping) and \
+                self.pointer.contains(from_ptr):
+            raise JsonPatchConflict('Cannot move values into their own children')
+
+        obj, add_inverse = RemoveOperation({
+            'op': 'remove',
+            'path': self.operation['from']
+        }, pointer_cls=self.pointer_cls).apply_with_inverse(obj)
+
+        obj, remove_inverse = AddOperation({
+            'op': 'add',
+            'path': self.location,
+            'value': value
+        }, pointer_cls=self.pointer_cls).apply_with_inverse(obj)
+
+        return obj, remove_inverse + add_inverse
 
     @property
     def from_path(self):
@@ -475,6 +629,9 @@ class TestOperation(PatchOperation):
 
         return obj
 
+    def apply_with_inverse(self, obj):
+        return self.apply(obj), []
+
 
 class CopyOperation(PatchOperation):
     """ Copies an object property or an array element to a new location """
@@ -499,6 +656,25 @@ class CopyOperation(PatchOperation):
         }, pointer_cls=self.pointer_cls).apply(obj)
 
         return obj
+
+    def apply_with_inverse(self, obj):
+        try:
+            from_ptr = self.pointer_cls(self.operation['from'])
+        except KeyError as ex:
+            raise InvalidJsonPatch(
+                "The operation does not contain a 'from' member")
+
+        subobj, part = from_ptr.to_last(obj)
+        try:
+            value = copy.deepcopy(subobj[part])
+        except (KeyError, IndexError) as ex:
+            raise JsonPatchConflict(str(ex))
+
+        return AddOperation({
+            'op': 'add',
+            'path': self.location,
+            'value': value
+        }, pointer_cls=self.pointer_cls).apply_with_inverse(obj)
 
 
 class JsonPatch(object):
@@ -692,6 +868,18 @@ class JsonPatch(object):
             obj = operation.apply(obj)
 
         return obj
+
+    def apply_with_inverse(self, obj, in_place=False):
+        """Apply this patch and return the result and inverse operations."""
+        if not in_place:
+            obj = copy.deepcopy(obj)
+
+        inverse = []
+        for operation in self._ops:
+            obj, operation_inverse = operation.apply_with_inverse(obj)
+            inverse = operation_inverse + inverse
+
+        return obj, inverse
 
     def _get_operation(self, operation):
         if 'op' not in operation:

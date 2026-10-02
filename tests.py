@@ -250,6 +250,216 @@ class ApplyPatchTestCase(unittest.TestCase):
                           obj, '[{"op": "add", "path": null, "value": "bar"}]')
 
 
+class RootDocumentTestCase(unittest.TestCase):
+    """Operations targeting the document root via the empty JSON Pointer"""
+
+    def test_add_root_all_doc_types(self):
+        docs = [
+            {'foo': 'bar'},
+            [1, 2, 3],
+            'a string',
+            42,
+            True,
+            None,
+        ]
+        for doc in docs:
+            res = jsonpatch.apply_patch(doc, [{'op': 'add', 'path': '', 'value': {'ok': 1}}])
+            self.assertEqual(res, {'ok': 1})
+
+    def test_replace_root_all_doc_types(self):
+        docs = [
+            {'foo': 'bar'},
+            [1, 2, 3],
+            'a string',
+            42,
+            True,
+            None,
+        ]
+        for doc in docs:
+            res = jsonpatch.apply_patch(doc, [{'op': 'replace', 'path': '', 'value': [0]}])
+            self.assertEqual(res, [0])
+
+    def test_test_root_all_doc_types(self):
+        docs = [
+            {'foo': 'bar'},
+            [1, 2, 3],
+            'a string',
+            42,
+            True,
+            None,
+        ]
+        for doc in docs:
+            res = jsonpatch.apply_patch(doc, [{'op': 'test', 'path': '', 'value': doc}])
+            self.assertEqual(res, doc)
+
+    def test_test_root_failure(self):
+        self.assertRaises(jsonpatch.JsonPatchTestFailed, jsonpatch.apply_patch,
+                          [1], [{'op': 'test', 'path': '', 'value': [2]}])
+
+    def test_root_type_change_sequence(self):
+        # a patch may change the type of the root between operations
+        res = jsonpatch.apply_patch([1, 2, 3], [
+            {'op': 'test', 'path': '', 'value': [1, 2, 3]},
+            {'op': 'replace', 'path': '', 'value': {'foo': None}},
+            {'op': 'add', 'path': '/foo', 'value': [1, 2]},
+            {'op': 'move', 'from': '/foo', 'path': '/bar'},
+            {'op': 'copy', 'from': '/bar', 'path': '/baz'},
+            {'op': 'test', 'path': '', 'value': {'bar': [1, 2], 'baz': [1, 2]}},
+        ])
+        self.assertEqual(res, {'bar': [1, 2], 'baz': [1, 2]})
+
+    def test_add_root_then_scalar(self):
+        res = jsonpatch.apply_patch({'a': 1}, [
+            {'op': 'add', 'path': '', 'value': 'text'},
+            {'op': 'replace', 'path': '', 'value': 7},
+            {'op': 'test', 'path': '', 'value': 7},
+        ])
+        self.assertEqual(res, 7)
+
+    def test_copy_from_root(self):
+        obj = {'foo': 'bar'}
+        res = jsonpatch.apply_patch(obj, [{'op': 'copy', 'from': '', 'path': '/backup'}])
+        self.assertEqual(res, {'foo': 'bar', 'backup': {'foo': 'bar'}})
+
+    def test_copy_from_root_array_doc(self):
+        obj = [1, 2]
+        res = jsonpatch.apply_patch(obj, [{'op': 'copy', 'from': '', 'path': '/-'}])
+        self.assertEqual(res, [1, 2, [1, 2]])
+
+    def test_copy_root_does_not_share_mutables(self):
+        # the copied root must be a deep copy, not an alias of the source
+        obj = {'items': [1, 2]}
+        res = jsonpatch.apply_patch(obj, [
+            {'op': 'copy', 'from': '', 'path': '/backup'},
+            {'op': 'add', 'path': '/items/0', 'value': 99},
+        ])
+        self.assertEqual(res, {'items': [99, 1, 2], 'backup': {'items': [1, 2]}})
+
+    def test_copy_root_onto_root(self):
+        obj = {'items': [1, 2]}
+        res = jsonpatch.apply_patch(obj, [{'op': 'copy', 'from': '', 'path': ''}])
+        self.assertEqual(res, {'items': [1, 2]})
+        # mutating the result must not affect the caller's document
+        res['items'].append(3)
+        self.assertEqual(obj, {'items': [1, 2]})
+
+    def test_move_root_to_root_is_noop(self):
+        obj = {'foo': 'bar'}
+        res = jsonpatch.apply_patch(obj, [{'op': 'move', 'from': '', 'path': ''}])
+        self.assertEqual(res, {'foo': 'bar'})
+
+    def test_move_root_into_child_rejected(self):
+        for doc in ({'foo': 'bar'}, [1, 2]):
+            self.assertRaises(jsonpatch.JsonPatchConflict, jsonpatch.apply_patch,
+                              doc, [{'op': 'move', 'from': '', 'path': '/foo'}])
+
+    def test_move_root_into_child_keeps_source(self):
+        # the source document must not be destroyed by the rejected move
+        obj = {'foo': 'bar'}
+        self.assertRaises(jsonpatch.JsonPatchConflict, jsonpatch.apply_patch,
+                          obj, [{'op': 'move', 'from': '', 'path': '/foo/bar'}], in_place=True)
+        self.assertEqual(obj, {'foo': 'bar'})
+
+        obj = [1, 2]
+        self.assertRaises(jsonpatch.JsonPatchConflict, jsonpatch.apply_patch,
+                          obj, [{'op': 'move', 'from': '', 'path': '/0'}], in_place=True)
+        self.assertEqual(obj, [1, 2])
+
+    def test_move_value_to_root(self):
+        obj = {'foo': 'bar', 'baz': 'qux'}
+        res = jsonpatch.apply_patch(obj, [{'op': 'move', 'from': '/foo', 'path': ''}])
+        self.assertEqual(res, 'bar')
+
+    def test_move_same_location_is_noop(self):
+        obj = {'foo': {'bar': 'baz'}}
+        res = jsonpatch.apply_patch(obj, [{'op': 'move', 'from': '/foo', 'path': '/foo'}])
+        self.assertEqual(res, {'foo': {'bar': 'baz'}})
+
+    def test_move_same_array_index_semantics(self):
+        obj = {'foo': ['all', 'grass', 'cows', 'eat']}
+        res = jsonpatch.apply_patch(obj, [{'op': 'move', 'from': '/foo/1', 'path': '/foo/3'}])
+        self.assertEqual(res, {'foo': ['all', 'cows', 'eat', 'grass']})
+        res = jsonpatch.apply_patch(obj, [{'op': 'move', 'from': '/foo/3', 'path': '/foo/1'}])
+        self.assertEqual(res, {'foo': ['all', 'eat', 'grass', 'cows']})
+
+    def test_move_root_array_index_semantics(self):
+        res = jsonpatch.apply_patch(['a', 'b', 'c'], [{'op': 'move', 'from': '/0', 'path': '/2'}])
+        self.assertEqual(res, ['b', 'c', 'a'])
+
+    def test_empty_key_is_not_root(self):
+        # '/' addresses the empty-string key, '' addresses the whole document
+        res = jsonpatch.apply_patch({}, [{'op': 'add', 'path': '/', 'value': 'empty key'}])
+        self.assertEqual(res, {'': 'empty key'})
+        res = jsonpatch.apply_patch({}, [
+            {'op': 'add', 'path': '/', 'value': 'empty key'},
+            {'op': 'test', 'path': '', 'value': {'': 'empty key'}},
+            {'op': 'replace', 'path': '', 'value': [1]},
+        ])
+        self.assertEqual(res, [1])
+
+    def test_escaped_keys_are_not_root(self):
+        # '~1' unescapes to '/', '~0' unescapes to '~'
+        res = jsonpatch.apply_patch({}, [
+            {'op': 'add', 'path': '/a~1b', 'value': 1},
+            {'op': 'add', 'path': '/a~0b', 'value': 2},
+        ])
+        self.assertEqual(res, {'a/b': 1, 'a~b': 2})
+        res = jsonpatch.apply_patch(res, [
+            {'op': 'test', 'path': '/a~1b', 'value': 1},
+            {'op': 'move', 'from': '/a~0b', 'path': '/a~1b'},
+        ])
+        self.assertEqual(res, {'a/b': 2})
+
+    def test_root_ops_not_in_place(self):
+        # without in_place the caller's document must stay untouched
+        obj = {'foo': 'bar'}
+        res = jsonpatch.apply_patch(obj, [{'op': 'add', 'path': '', 'value': [1]}])
+        self.assertEqual(res, [1])
+        self.assertEqual(obj, {'foo': 'bar'})
+
+        obj = [1, 2]
+        res = jsonpatch.apply_patch(obj, [{'op': 'copy', 'from': '', 'path': '/-'}])
+        self.assertEqual(res, [1, 2, [1, 2]])
+        self.assertEqual(obj, [1, 2])
+
+    def test_root_ops_in_place(self):
+        # in_place mutates the caller's object for non-root operations
+        obj = {'foo': 'bar'}
+        res = jsonpatch.apply_patch(obj, [{'op': 'add', 'path': '/baz', 'value': 1}],
+                                    in_place=True)
+        self.assertIs(res, obj)
+        self.assertEqual(obj, {'foo': 'bar', 'baz': 1})
+
+        # replacing the root returns a new object even with in_place; the
+        # caller's object cannot be swapped out from under its reference
+        obj = {'foo': 'bar'}
+        res = jsonpatch.apply_patch(obj, [{'op': 'add', 'path': '', 'value': [1]}],
+                                    in_place=True)
+        self.assertEqual(res, [1])
+        self.assertEqual(obj, {'foo': 'bar'})
+
+    def test_root_errors_are_patch_exceptions(self):
+        # invalid root operations must raise this library's exceptions,
+        # not leak TypeError from incidental None indexing
+        cases = [
+            ([1, 2], [{'op': 'add', 'path': '', 'value': {'ok': 1}}], None),
+            ({'a': 1}, [{'op': 'copy', 'from': '', 'path': '/b'}], None),
+            ([1, 2], [{'op': 'move', 'from': '', 'path': '/0'}],
+             jsonpatch.JsonPatchException),
+            ({'a': 1}, [{'op': 'move', 'from': '', 'path': '/a/b'}],
+             jsonpatch.JsonPatchException),
+            ([1, 2], [{'op': 'copy', 'from': '/5', 'path': '/0'}],
+             jsonpatch.JsonPatchException),
+            ({'a': 1}, [{'op': 'move', 'from': '/missing', 'path': '/b'}],
+             jsonpatch.JsonPatchException),
+        ]
+        for doc, patch, expected_exc in cases:
+            if expected_exc is None:
+                jsonpatch.apply_patch(doc, patch)
+            else:
+                self.assertRaises(expected_exc, jsonpatch.apply_patch, doc, patch)
+
+
 class EqualityTestCase(unittest.TestCase):
 
     def test_patch_equality(self):
@@ -1049,6 +1259,7 @@ if __name__ == '__main__':
         suite = unittest.TestSuite()
         suite.addTest(doctest.DocTestSuite(jsonpatch))
         suite.addTest(unittest.makeSuite(ApplyPatchTestCase))
+        suite.addTest(unittest.makeSuite(RootDocumentTestCase))
         suite.addTest(unittest.makeSuite(EqualityTestCase))
         suite.addTest(unittest.makeSuite(MakePatchTestCase))
         suite.addTest(unittest.makeSuite(ListTests))

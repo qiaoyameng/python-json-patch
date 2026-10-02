@@ -281,6 +281,10 @@ class AddOperation(PatchOperation):
 
         subobj, part = self.pointer.to_last(obj)
 
+        if part is None:
+            obj = value  # we're replacing the root
+            return obj
+
         if isinstance(subobj, MutableSequence):
             if part == '-':
                 subobj.append(value)  # pylint: disable=E1103
@@ -292,16 +296,10 @@ class AddOperation(PatchOperation):
                 subobj.insert(part, value)  # pylint: disable=E1103
 
         elif isinstance(subobj, MutableMapping):
-            if part is None:
-                obj = value  # we're replacing the root
-            else:
-                subobj[part] = value
+            subobj[part] = value
 
         else:
-            if part is None:
-                raise TypeError("invalid document type {0}".format(type(subobj)))
-            else:
-                raise JsonPatchConflict("unable to fully resolve json pointer {0}, part {1}".format(self.location, part))
+            raise JsonPatchConflict("unable to fully resolve json pointer {0}, part {1}".format(self.location, part))
         return obj
 
     def _on_undo_remove(self, path, key):
@@ -348,10 +346,7 @@ class ReplaceOperation(PatchOperation):
                 msg = "can't replace a non-existent object '{0}'".format(part)
                 raise JsonPatchConflict(msg)
         else:
-            if part is None:
-                raise TypeError("invalid document type {0}".format(type(subobj)))
-            else:
-                raise JsonPatchConflict("unable to fully resolve json pointer {0}, part {1}".format(self.location, part))
+            raise JsonPatchConflict("unable to fully resolve json pointer {0}, part {1}".format(self.location, part))
 
         subobj[part] = value
         return obj
@@ -377,14 +372,23 @@ class MoveOperation(PatchOperation):
                 "The operation does not contain a 'from' member")
 
         subobj, part = from_ptr.to_last(obj)
-        try:
-            value = subobj[part]
-        except (KeyError, IndexError) as ex:
-            raise JsonPatchConflict(str(ex))
+        if part is None:
+            # 'from' refers to the whole document
+            value = subobj
+        else:
+            try:
+                value = subobj[part]
+            except (KeyError, IndexError) as ex:
+                raise JsonPatchConflict(str(ex))
 
         # If source and target are equal, this is a no-op
         if self.pointer == from_ptr:
             return obj
+
+        if not from_ptr.parts:
+            # every other location is a child of the root, so the root
+            # cannot be moved anywhere but onto itself
+            raise JsonPatchConflict('Cannot move values into their own children')
 
         if isinstance(subobj, MutableMapping) and \
                 self.pointer.contains(from_ptr):
@@ -481,16 +485,23 @@ class CopyOperation(PatchOperation):
 
     def apply(self, obj):
         try:
-            from_ptr = self.pointer_cls(self.operation['from'])
+            if isinstance(self.operation['from'], self.pointer_cls):
+                from_ptr = self.operation['from']
+            else:
+                from_ptr = self.pointer_cls(self.operation['from'])
         except KeyError as ex:
             raise InvalidJsonPatch(
                 "The operation does not contain a 'from' member")
 
         subobj, part = from_ptr.to_last(obj)
-        try:
-            value = copy.deepcopy(subobj[part])
-        except (KeyError, IndexError) as ex:
-            raise JsonPatchConflict(str(ex))
+        if part is None:
+            # 'from' refers to the whole document
+            value = copy.deepcopy(subobj)
+        else:
+            try:
+                value = copy.deepcopy(subobj[part])
+            except (KeyError, IndexError) as ex:
+                raise JsonPatchConflict(str(ex))
 
         obj = AddOperation({
             'op': 'add',

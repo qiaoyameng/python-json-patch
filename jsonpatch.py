@@ -98,6 +98,23 @@ class JsonPatchTestFailed(JsonPatchException, AssertionError):
     """ A Test operation failed """
 
 
+class JsonPatchAccessDenied(JsonPatchException):
+    """A patch operation violates the read/write scope policy.
+
+    Only the operation position and the required permission are recorded;
+    no document values are included so that denied requests cannot leak
+    sensitive subtree content through the exception.
+    """
+
+    def __init__(self, index, path, permission):
+        self.index = index
+        self.path = path
+        self.permission = permission
+        msg = "operation #{0} requires {1} access to {2!r}".format(
+            index, permission, path)
+        super(JsonPatchAccessDenied, self).__init__(msg)
+
+
 def multidict(ordered_pairs):
     """Convert duplicate keys values to lists."""
     # read all values into lists
@@ -117,7 +134,8 @@ def multidict(ordered_pairs):
 _jsonloads = functools.partial(json.loads, object_pairs_hook=multidict)
 
 
-def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer):
+def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer,
+                scope=None):
     """Apply list of patches to specified json document.
 
     :param doc: Document object.
@@ -132,6 +150,10 @@ def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer):
 
     :param pointer_cls: JSON pointer class to use.
     :type pointer_cls: Type[JsonPointer]
+
+    :param scope: Optional ScopePolicy restricting which parts of
+                  the document may be read or modified.
+    :type scope: ScopePolicy
 
     :return: Patched document object.
     :rtype: dict
@@ -154,7 +176,7 @@ def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer):
         patch = JsonPatch.from_string(patch, pointer_cls=pointer_cls)
     else:
         patch = JsonPatch(patch, pointer_cls=pointer_cls)
-    return patch.apply(doc, in_place)
+    return patch.apply(doc, in_place, scope=scope)
 
 
 def make_patch(src, dst, pointer_cls=JsonPointer):
@@ -501,6 +523,149 @@ class CopyOperation(PatchOperation):
         return obj
 
 
+def _is_array(node):
+    return isinstance(node, Sequence) and not isinstance(node, basestring)
+
+
+def _scope_descend(node, part):
+    """Descends one step into 'node' following 'part', or returns None."""
+    if _is_array(node):
+        try:
+            return node[int(part)]
+        except (TypeError, ValueError, IndexError):
+            return None
+    if isinstance(node, MutableMapping):
+        return node.get(part)
+    return None
+
+
+class ScopePolicy(object):
+    """Optional read/write scope policy for JSON Patch operations.
+
+    A scope is a set of *parsed* JSON pointer prefixes. A pointer is
+    permitted when at least one scope prefix is a prefix of the pointer's
+    parsed parts. All comparisons are performed on parsed parts, never on
+    raw strings, so the root pointer, empty keys, ~0 / ~1 escapes and
+    array indices are matched according to the real document structure
+    (array indices are canonicalized while walking the actual document,
+    e.g. '-' resolves to the current length of the array).
+
+    Permission requirements per operation:
+
+    - add, remove, replace: write access to 'path';
+    - test: read access to 'path';
+    - copy: read access to 'from', write access to 'path';
+    - move: read and write access to 'from', write access to 'path'.
+
+    Replacing or removing an ancestor of a protected location is denied,
+    because the ancestor itself is not covered by any scope prefix.
+
+    :param read: Iterable of readable pointer prefixes. Each entry may be
+                 a JSON pointer string, a JsonPointer instance or an
+                 iterable of already-parsed parts.
+    :param write: Iterable of writable pointer prefixes, same format.
+    :param pointer_cls: JSON pointer class to use.
+    """
+
+    def __init__(self, read=(), write=(), pointer_cls=JsonPointer):
+        self.pointer_cls = pointer_cls
+        self.read = frozenset(self._parse_prefix(prefix) for prefix in read)
+        self.write = frozenset(self._parse_prefix(prefix) for prefix in write)
+
+    def _parse_prefix(self, prefix):
+        if isinstance(prefix, self.pointer_cls):
+            return tuple(prefix.parts)
+        if isinstance(prefix, basestring):
+            return tuple(self.pointer_cls(prefix).parts)
+        return tuple(prefix)
+
+    def _resolve_parts(self, pointer, doc):
+        """Canonicalizes pointer parts against the real document structure."""
+        parts = pointer.parts
+        if doc is None:
+            return tuple(parts)
+        resolved = []
+        node = doc
+        for part in parts:
+            if _is_array(node):
+                if part == '-':
+                    part = str(len(node))
+                else:
+                    try:
+                        part = str(int(part))
+                    except (TypeError, ValueError):
+                        pass
+            resolved.append(part)
+            node = _scope_descend(node, part)
+        return tuple(resolved)
+
+    def allows(self, pointer, permission, doc=None):
+        """Tells whether 'pointer' may be accessed with 'permission'.
+
+        :param pointer: JSON pointer string or JsonPointer instance.
+        :param permission: Either 'read' or 'write'.
+        :param doc: Document used to resolve array indices. When omitted,
+                    pointer parts are compared literally.
+        """
+        if permission not in ('read', 'write'):
+            raise ValueError("unknown permission {0!r}".format(permission))
+        if not isinstance(pointer, self.pointer_cls):
+            pointer = self.pointer_cls(pointer)
+        prefixes = self.read if permission == 'read' else self.write
+        parts = self._resolve_parts(pointer, doc)
+        return any(parts[:len(prefix)] == prefix for prefix in prefixes)
+
+    def _requirements(self, operation):
+        """Yields (pointer, permission) pairs required by 'operation'."""
+        if isinstance(operation, (AddOperation, RemoveOperation,
+                                  ReplaceOperation)):
+            return [(operation.pointer, 'write')]
+        if isinstance(operation, TestOperation):
+            return [(operation.pointer, 'read')]
+        if isinstance(operation, (CopyOperation, MoveOperation)):
+            try:
+                from_raw = operation.operation['from']
+            except KeyError:
+                raise InvalidJsonPatch(
+                    "The operation does not contain a 'from' member")
+            if isinstance(from_raw, self.pointer_cls):
+                from_ptr = from_raw
+            else:
+                from_ptr = self.pointer_cls(from_raw)
+            requirements = [(from_ptr, 'read')]
+            if isinstance(operation, MoveOperation):
+                requirements.append((from_ptr, 'write'))
+            requirements.append((operation.pointer, 'write'))
+            return requirements
+        return []
+
+    def check_operation(self, operation, index, doc=None):
+        """Checks a single operation against this policy.
+
+        Raises JsonPatchAccessDenied before any value is read
+        from the document, so a denied request cannot leak source values.
+        """
+        for pointer, permission in self._requirements(operation):
+            if not self.allows(pointer, permission, doc):
+                raise JsonPatchAccessDenied(index, pointer.path, permission)
+
+    def check(self, patch, doc):
+        """Pre-checks a whole patch without modifying 'doc'.
+
+        Operations are simulated on a deep copy of 'doc', so permission
+        checks for later operations observe the structural changes (such
+        as shifted array indices) introduced by earlier ones. Raises
+        JsonPatchAccessDenied on the first denied operation.
+        """
+        if not isinstance(patch, JsonPatch):
+            patch = JsonPatch(patch, pointer_cls=self.pointer_cls)
+        simulated = copy.deepcopy(doc)
+        for index, operation in enumerate(patch._ops):
+            self.check_operation(operation, index, simulated)
+            simulated = operation.apply(simulated)
+        return True
+
+
 class JsonPatch(object):
     json_dumper = staticmethod(json.dumps)
     json_loader = staticmethod(_jsonloads)
@@ -672,7 +837,7 @@ class JsonPatch(object):
     def _ops(self):
         return tuple(map(self._get_operation, self.patch))
 
-    def apply(self, obj, in_place=False):
+    def apply(self, obj, in_place=False, scope=None):
         """Applies the patch to a given object.
 
         :param obj: Document object.
@@ -682,16 +847,42 @@ class JsonPatch(object):
                          specified `obj` or to its copy.
         :type in_place: bool
 
+        :param scope: Optional ScopePolicy checked before every operation.
+                      A denied operation raises JsonPatchAccessDenied before
+                      the operation is evaluated, so source values of a
+                      rejected copy or move are never read.
+        :type scope: ScopePolicy
+
         :return: Modified `obj`.
         """
 
         if not in_place:
             obj = copy.deepcopy(obj)
 
-        for operation in self._ops:
+        for index, operation in enumerate(self._ops):
+            if scope is not None:
+                scope.check_operation(operation, index, obj)
             obj = operation.apply(obj)
 
         return obj
+
+    def check_scope(self, obj, scope):
+        """Pre-checks the whole patch against a ScopePolicy.
+
+        The document is not modified; operations are simulated on a deep
+        copy so that checks for later operations observe structural
+        changes (such as shifted array indices) introduced by earlier
+        ones. Raises JsonPatchAccessDenied on the first denied operation.
+
+        :param obj: Document object the patch would be applied to.
+        :type obj: dict
+
+        :param scope: The ScopePolicy to check against.
+        :type scope: ScopePolicy
+
+        :return: True if every operation is permitted.
+        """
+        return scope.check(self, obj)
 
     def _get_operation(self, operation):
         if 'op' not in operation:

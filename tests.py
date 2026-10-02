@@ -1041,6 +1041,161 @@ class CustomOperationTests(unittest.TestCase):
         self.assertEqual(res, {})
 
 
+class ScopePolicyTests(unittest.TestCase):
+
+    def setUp(self):
+        self.doc = {
+            'profile': {
+                'public': {'name': 'ada'},
+                'private': {'ssn': '123'},
+            },
+            'secrets': {'apikey': 'TOPSECRET'},
+            'items': ['a', 'b', 'c'],
+        }
+        self.scope = jsonpatch.ScopePolicy(
+            read=['/profile'],
+            write=['/profile/public'],
+        )
+
+    def test_add_within_write_scope(self):
+        patch = [{'op': 'add', 'path': '/profile/public/age', 'value': 36}]
+        result = jsonpatch.apply_patch(self.doc, patch, scope=self.scope)
+        self.assertEqual(result['profile']['public']['age'], 36)
+
+    def test_copy_from_secrets_denied(self):
+        patch = [{'op': 'copy', 'from': '/secrets/apikey',
+                  'path': '/profile/public/leak'}]
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as ctx:
+            jsonpatch.apply_patch(self.doc, patch, scope=self.scope)
+        exc = ctx.exception
+        self.assertEqual(exc.index, 0)
+        self.assertEqual(exc.path, '/secrets/apikey')
+        self.assertEqual(exc.permission, 'read')
+        # the exception must not leak the source value
+        self.assertNotIn('TOPSECRET', str(exc))
+
+    def test_copy_within_scope_allowed(self):
+        scope = jsonpatch.ScopePolicy(read=['/profile'], write=['/profile'])
+        patch = [{'op': 'copy', 'from': '/profile/public/name',
+                  'path': '/profile/private/nick'}]
+        result = jsonpatch.apply_patch(self.doc, patch, scope=scope)
+        self.assertEqual(result['profile']['private']['nick'], 'ada')
+
+    def test_move_source_requires_read_and_write(self):
+        # source is readable but not writable
+        patch = [{'op': 'move', 'from': '/profile/private/ssn',
+                  'path': '/profile/public/ssn'}]
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as ctx:
+            jsonpatch.apply_patch(self.doc, patch, scope=self.scope)
+        self.assertEqual(ctx.exception.permission, 'write')
+        self.assertEqual(ctx.exception.path, '/profile/private/ssn')
+        self.assertNotIn('123', str(ctx.exception))
+
+    def test_move_target_requires_write(self):
+        scope = jsonpatch.ScopePolicy(read=[''], write=['/profile/public'])
+        patch = [{'op': 'move', 'from': '/profile/public/name',
+                  'path': '/profile/private/name'}]
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as ctx:
+            jsonpatch.apply_patch(self.doc, patch, scope=scope)
+        self.assertEqual(ctx.exception.path, '/profile/private/name')
+
+    def test_test_operation_requires_read(self):
+        patch = [{'op': 'test', 'path': '/secrets/apikey', 'value': 'x'}]
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as ctx:
+            jsonpatch.apply_patch(self.doc, patch, scope=self.scope)
+        self.assertEqual(ctx.exception.permission, 'read')
+
+    def test_ancestor_replace_denied(self):
+        # replacing /profile would clobber the protected /profile/private
+        patch = [{'op': 'replace', 'path': '/profile', 'value': {}}]
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+            jsonpatch.apply_patch(self.doc, patch, scope=self.scope)
+
+    def test_ancestor_remove_denied(self):
+        patch = [{'op': 'remove', 'path': '/profile'}]
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+            jsonpatch.apply_patch(self.doc, patch, scope=self.scope)
+
+    def test_root_pointer_requires_root_scope(self):
+        patch = [{'op': 'replace', 'path': '', 'value': {}}]
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+            jsonpatch.apply_patch(self.doc, patch, scope=self.scope)
+        root_scope = jsonpatch.ScopePolicy(read=[''], write=[''])
+        result = jsonpatch.apply_patch(self.doc, patch, scope=root_scope)
+        self.assertEqual(result, {})
+
+    def test_empty_key_and_escapes(self):
+        doc = {'a/b': {'~x': 1}, '': 2}
+        scope = jsonpatch.ScopePolicy(read=['/a~1b'], write=['/a~1b'])
+        self.assertTrue(scope.allows('/a~1b/~0x', 'read', doc))
+        # empty key is a distinct part, not covered by the scope
+        self.assertFalse(scope.allows('/', 'read', doc))
+        # string startswith would match /a~1b2; parsed parts must not
+        self.assertFalse(scope.allows('/a~1b2', 'read', doc))
+
+    def test_array_append_resolved_by_structure(self):
+        doc = {'items': ['a', 'b', 'c']}
+        scope = jsonpatch.ScopePolicy(read=['/items'], write=['/items/3'])
+        # '-' appends, i.e. writes index 3 of the current array
+        patch = [{'op': 'add', 'path': '/items/-', 'value': 'd'}]
+        result = jsonpatch.apply_patch(doc, patch, scope=scope)
+        self.assertEqual(result['items'], ['a', 'b', 'c', 'd'])
+        # with a shorter array the same patch writes index 2: denied
+        short = {'items': ['a', 'b']}
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+            jsonpatch.apply_patch(short, patch, scope=scope)
+
+    def test_numeric_dict_key_is_not_array_index(self):
+        doc = {'obj': {'01': 'secret', '1': 'ok'}}
+        scope = jsonpatch.ScopePolicy(read=['/obj'], write=['/obj/1'])
+        self.assertFalse(scope.allows('/obj/01', 'write', doc))
+        self.assertTrue(scope.allows('/obj/1', 'write', doc))
+
+    def test_precheck_simulates_index_shift(self):
+        doc = {'items': ['a', 'b', 'c']}
+        scope = jsonpatch.ScopePolicy(read=['/items'], write=['/items'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'add', 'path': '/items/0', 'value': 'z'},
+            {'op': 'remove', 'path': '/items/2'},
+        ])
+        self.assertTrue(patch.check_scope(doc, scope))
+        # the original document is not modified by the precheck
+        self.assertEqual(doc, {'items': ['a', 'b', 'c']})
+        result = patch.apply(doc, scope=scope)
+        self.assertEqual(result['items'], ['z', 'a', 'c'])
+
+    def test_precheck_denied_after_index_shift(self):
+        doc = {'items': ['a', 'b', 'c']}
+        # only the first slot is writable
+        scope = jsonpatch.ScopePolicy(read=['/items'], write=['/items/0'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'add', 'path': '/items/0', 'value': 'z'},
+            {'op': 'remove', 'path': '/items/1'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as ctx:
+            patch.check_scope(doc, scope)
+        self.assertEqual(ctx.exception.index, 1)
+        self.assertEqual(doc, {'items': ['a', 'b', 'c']})
+
+    def test_denied_op_does_not_modify_document(self):
+        doc = {'profile': {'public': {}, 'private': 1}}
+        original = {'profile': {'public': {}, 'private': 1}}
+        patch = [
+            {'op': 'add', 'path': '/profile/public/x', 'value': 1},
+            {'op': 'remove', 'path': '/profile/private'},
+        ]
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as ctx:
+            jsonpatch.apply_patch(doc, patch, scope=self.scope)
+        self.assertEqual(ctx.exception.index, 1)
+        # apply() works on a copy, so the original stays untouched
+        self.assertEqual(doc, original)
+
+    def test_check_scope_accepts_plain_patch_list(self):
+        scope = jsonpatch.ScopePolicy(read=['/profile'], write=['/profile'])
+        patch = [{'op': 'remove', 'path': '/profile/private'}]
+        self.assertTrue(scope.check(patch, self.doc))
+
+
 if __name__ == '__main__':
     modules = ['jsonpatch']
 
@@ -1060,6 +1215,7 @@ if __name__ == '__main__':
         suite.addTest(unittest.makeSuite(UtilityMethodTests))
         suite.addTest(unittest.makeSuite(CustomJsonPointerTests))
         suite.addTest(unittest.makeSuite(CustomOperationTests))
+        suite.addTest(unittest.makeSuite(ScopePolicyTests))
         return suite
 
 

@@ -1041,9 +1041,141 @@ class CustomOperationTests(unittest.TestCase):
         self.assertEqual(res, {})
 
 
+class ArrayIdentityTestCase(unittest.TestCase):
+
+    @staticmethod
+    def _order(item_id, qty, payload):
+        return {'line_id': item_id, 'qty': qty, 'payload': payload}
+
+    def test_swap_and_modify(self):
+        # swapping two large objects and changing a field of one of them
+        # should produce a move plus a small field patch, not rewrites
+        payload_a, payload_b = 'A' * 1000, 'B' * 1000
+        src = {'lines': [self._order('a', 1, payload_a),
+                         self._order('b', 2, payload_b)]}
+        dst = {'lines': [self._order('b', 2, payload_b),
+                         self._order('a', 5, payload_a)]}
+        patch = jsonpatch.make_patch(src, dst, array_keys={'/lines': 'line_id'})
+        self.assertEqual(patch.apply(src), dst)
+        ops = patch.patch
+        self.assertIn({'op': 'move', 'from': '/lines/1', 'path': '/lines/0'}, ops)
+        self.assertIn({'op': 'replace', 'path': '/lines/0/qty', 'value': 5}, ops)
+        self.assertEqual(len(ops), 2)
+        # the unchanged large fields must not be rewritten
+        for op in ops:
+            self.assertNotIn('payload', op['path'])
+            self.assertNotEqual(op.get('value'), payload_a)
+            self.assertNotEqual(op.get('value'), payload_b)
+
+    def test_reorder_only_emits_only_moves(self):
+        payload = 'x' * 500
+        src = {'lines': [self._order('a', 1, payload),
+                         self._order('b', 2, payload),
+                         self._order('c', 3, payload)]}
+        dst = {'lines': [self._order('c', 3, payload),
+                         self._order('a', 1, payload),
+                         self._order('b', 2, payload)]}
+        patch = jsonpatch.make_patch(src, dst, array_keys={'/lines': 'line_id'})
+        self.assertEqual(patch.apply(src), dst)
+        for op in patch.patch:
+            self.assertEqual(op['op'], 'move')
+            self.assertNotIn('value', op)
+
+    def test_head_tail_insert_remove(self):
+        src = {'l': [{'id': 'x'}, {'id': 'a'}, {'id': 'b'}, {'id': 'y'}]}
+        dst = {'l': [{'id': 'n1', 'v': 1}, {'id': 'a'}, {'id': 'b'},
+                     {'id': 'n2', 'v': 2}]}
+        patch = jsonpatch.make_patch(src, dst, array_keys={'/l': 'id'})
+        self.assertEqual(patch.apply(src), dst)
+        # elements 'a' and 'b' are untouched: no op may point inside them
+        for op in patch.patch:
+            self.assertNotIn(op.get('path'), ('/l/1', '/l/2'))
+            self.assertNotEqual(op.get('value'), {'id': 'a'})
+            self.assertNotEqual(op.get('value'), {'id': 'b'})
+
+    def test_nested_arrays_with_own_rules(self):
+        src = {'lines': [
+            {'line_id': 'A', 'tags': [{'tag_id': 't1', 'w': 1},
+                                      {'tag_id': 't2', 'w': 2},
+                                      {'tag_id': 't3', 'w': 3}]},
+            {'line_id': 'B', 'tags': []},
+        ]}
+        dst = {'lines': [
+            {'line_id': 'B', 'tags': []},
+            {'line_id': 'A', 'tags': [{'tag_id': 't3', 'w': 3},
+                                      {'tag_id': 't1', 'w': 9},
+                                      {'tag_id': 't2', 'w': 2}]},
+        ]}
+        rules = {'/lines': 'line_id', '/lines/0/tags': 'tag_id'}
+        patch = jsonpatch.make_patch(src, dst, array_keys=rules)
+        self.assertEqual(patch.apply(src), dst)
+        ops = patch.patch
+        # nested move inside the element and move of the element itself
+        self.assertIn({'op': 'move', 'from': '/lines/0/tags/2',
+                       'path': '/lines/0/tags/0'}, ops)
+        self.assertIn({'op': 'move', 'from': '/lines/1', 'path': '/lines/0'}, ops)
+        self.assertIn({'op': 'replace', 'path': '/lines/0/tags/0/w', 'value': 9}, ops)
+
+    def test_array_without_rule_uses_positional_algorithm(self):
+        src = {'l': [{'id': 'a', 'v': 1}, {'id': 'b', 'v': 2}]}
+        dst = {'l': [{'id': 'b', 'v': 2}, {'id': 'a', 'v': 1}]}
+        patch = jsonpatch.make_patch(src, dst)
+        self.assertEqual(patch.apply(src), dst)
+        # no identity rule: no move operations are generated
+        for op in patch.patch:
+            self.assertNotEqual(op['op'], 'move')
+
+    def test_missing_key_field_raises(self):
+        src = {'l': [{'id': 1}]}
+        dst = {'l': [{'id': 1}, {'other': 2}]}
+        self.assertRaises(jsonpatch.ArrayIdentityError,
+                          jsonpatch.make_patch, src, dst,
+                          array_keys={'/l': 'id'})
+
+    def test_duplicate_key_raises(self):
+        src = {'l': [{'id': 1}, {'id': 1, 'v': 2}]}
+        dst = {'l': [{'id': 1}, {'id': 1, 'v': 3}]}
+        self.assertRaises(jsonpatch.ArrayIdentityError,
+                          jsonpatch.make_patch, src, dst,
+                          array_keys={'/l': 'id'})
+
+    def test_non_scalar_key_raises(self):
+        src = {'l': [{'id': [1]}]}
+        dst = {'l': [{'id': [1]}, {'id': 2}]}
+        self.assertRaises(jsonpatch.ArrayIdentityError,
+                          jsonpatch.make_patch, src, dst,
+                          array_keys={'/l': 'id'})
+
+    def test_non_object_element_raises(self):
+        src = {'l': [1, 2]}
+        dst = {'l': [2, 1]}
+        self.assertRaises(jsonpatch.ArrayIdentityError,
+                          jsonpatch.make_patch, src, dst,
+                          array_keys={'/l': 'id'})
+
+    def test_fallback_to_positional_algorithm(self):
+        cases = [
+            ({'l': [{'id': 1}]}, {'l': [{'id': 1}, {'other': 2}]}),
+            ({'l': [{'id': 1}, {'id': 1}]}, {'l': [{'id': 1}]}),
+            ({'l': [{'id': [1]}]}, {'l': [{'id': [2]}]}),
+            ({'l': [1, 2]}, {'l': [2, 1]}),
+        ]
+        for src, dst in cases:
+            patch = jsonpatch.make_patch(src, dst, array_keys={'/l': 'id'},
+                                         array_key_fallback=True)
+            self.assertEqual(patch.apply(src), dst)
+
+    def test_root_array_rule(self):
+        src = [{'id': 'a'}, {'id': 'b'}]
+        dst = [{'id': 'b'}, {'id': 'a'}]
+        patch = jsonpatch.make_patch(src, dst, array_keys={'': 'id'})
+        self.assertEqual(patch.apply(src), dst)
+        self.assertEqual(patch.patch,
+                         [{'op': 'move', 'from': '/1', 'path': '/0'}])
+
+
 if __name__ == '__main__':
     modules = ['jsonpatch']
-
 
     def get_suite():
         suite = unittest.TestSuite()
@@ -1051,6 +1183,7 @@ if __name__ == '__main__':
         suite.addTest(unittest.makeSuite(ApplyPatchTestCase))
         suite.addTest(unittest.makeSuite(EqualityTestCase))
         suite.addTest(unittest.makeSuite(MakePatchTestCase))
+        suite.addTest(unittest.makeSuite(ArrayIdentityTestCase))
         suite.addTest(unittest.makeSuite(ListTests))
         suite.addTest(unittest.makeSuite(InvalidInputTests))
         suite.addTest(unittest.makeSuite(ConflictTests))

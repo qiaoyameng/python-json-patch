@@ -98,6 +98,13 @@ class JsonPatchTestFailed(JsonPatchException, AssertionError):
     """ A Test operation failed """
 
 
+class ArrayIdentityError(JsonPatchException):
+    """Raised when an array identity rule (see the ``array_keys`` argument
+    of :func:`make_patch`) cannot be applied, e.g. because an element is not
+    an object, the key field is missing, the key value is not a JSON scalar
+    or the same key occurs more than once."""
+
+
 def multidict(ordered_pairs):
     """Convert duplicate keys values to lists."""
     # read all values into lists
@@ -157,7 +164,8 @@ def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer):
     return patch.apply(doc, in_place)
 
 
-def make_patch(src, dst, pointer_cls=JsonPointer):
+def make_patch(src, dst, pointer_cls=JsonPointer, array_keys=None,
+               array_key_fallback=False):
     """Generates patch by comparing two document objects. Actually is
     a proxy to :meth:`JsonPatch.from_diff` method.
 
@@ -170,6 +178,22 @@ def make_patch(src, dst, pointer_cls=JsonPointer):
     :param pointer_cls: JSON pointer class to use.
     :type pointer_cls: Type[JsonPointer]
 
+    :param array_keys: Optional mapping of JSON Pointers to key field names.
+                       Arrays at the given locations are matched by the
+                       unique value of the named field of their object
+                       elements, producing ``move``/``add``/``remove``
+                       operations plus patches inside matched elements
+                       instead of positional rewrites.
+    :type array_keys: dict
+
+    :param array_key_fallback: When :const:`True`, arrays whose elements
+                               violate an identity rule (missing key,
+                               non-scalar key, duplicate key, non-object
+                               element) silently fall back to the default
+                               positional algorithm. By default an
+                               :exc:`ArrayIdentityError` is raised instead.
+    :type array_key_fallback: bool
+
     >>> src = {'foo': 'bar', 'numbers': [1, 3, 4, 8]}
     >>> dst = {'baz': 'qux', 'numbers': [1, 4, 7]}
     >>> patch = make_patch(src, dst)
@@ -178,7 +202,9 @@ def make_patch(src, dst, pointer_cls=JsonPointer):
     True
     """
 
-    return JsonPatch.from_diff(src, dst, pointer_cls=pointer_cls)
+    return JsonPatch.from_diff(src, dst, pointer_cls=pointer_cls,
+                               array_keys=array_keys,
+                               array_key_fallback=array_key_fallback)
 
 
 class PatchOperation(object):
@@ -629,7 +655,8 @@ class JsonPatch(object):
     @classmethod
     def from_diff(
             cls, src, dst, optimization=True, dumps=None,
-            pointer_cls=JsonPointer,
+            pointer_cls=JsonPointer, array_keys=None,
+            array_key_fallback=False,
     ):
         """Creates JsonPatch instance based on comparison of two document
         objects. Json patch would be created for `src` argument against `dst`
@@ -648,6 +675,18 @@ class JsonPatch(object):
         :param pointer_cls: JSON pointer class to use.
         :type pointer_cls: Type[JsonPointer]
 
+        :param array_keys: Optional mapping of JSON Pointers to key field
+                           names. Arrays at the given locations are matched
+                           by the unique value of the named field of their
+                           object elements. See :func:`make_patch`.
+        :type array_keys: dict
+
+        :param array_key_fallback: Fall back to the positional list
+                                   algorithm instead of raising
+                                   :exc:`ArrayIdentityError` when an
+                                   identity rule cannot be applied.
+        :type array_key_fallback: bool
+
         :return: :class:`JsonPatch` instance.
 
         >>> src = {'foo': 'bar', 'numbers': [1, 3, 4, 8]}
@@ -658,7 +697,9 @@ class JsonPatch(object):
         True
         """
         json_dumper = dumps or cls.json_dumper
-        builder = DiffBuilder(src, dst, json_dumper, pointer_cls=pointer_cls)
+        builder = DiffBuilder(src, dst, json_dumper, pointer_cls=pointer_cls,
+                              array_keys=array_keys,
+                              array_key_fallback=array_key_fallback)
         builder._compare_values('', None, src, dst)
         ops = list(builder.execute())
         return cls(ops, pointer_cls=pointer_cls)
@@ -711,7 +752,8 @@ class JsonPatch(object):
 
 class DiffBuilder(object):
 
-    def __init__(self, src_doc, dst_doc, dumps=json.dumps, pointer_cls=JsonPointer):
+    def __init__(self, src_doc, dst_doc, dumps=json.dumps, pointer_cls=JsonPointer,
+                 array_keys=None, array_key_fallback=False):
         self.dumps = dumps
         self.pointer_cls = pointer_cls
         self.index_storage = [{}, {}]
@@ -719,6 +761,14 @@ class DiffBuilder(object):
         self.__root = root = []
         self.src_doc = src_doc
         self.dst_doc = dst_doc
+        # normalize the rule pointers so that e.g. '/a//b' or pointer
+        # objects compare equal to the paths built by _path_join
+        self.array_keys = dict(
+            (self.pointer_cls(pointer).path if not isinstance(pointer, self.pointer_cls)
+             else pointer.path, key_field)
+            for pointer, key_field in (array_keys or {}).items()
+        )
+        self.array_key_fallback = array_key_fallback
         root[:] = [root, root, None]
 
     def store_index(self, value, index, st):
@@ -901,6 +951,102 @@ class DiffBuilder(object):
             else:
                 self._item_added(path, key, dst[key])
 
+    def _extract_array_keys(self, path, items, key_field):
+        """Extracts the identity key of every element of an array governed
+        by an identity rule. Returns a list of typed keys or None when the
+        rule cannot be applied and fallback mode is enabled."""
+
+        def fail(reason):
+            if self.array_key_fallback:
+                return None
+            raise ArrayIdentityError(
+                "array identity rule for '{0}' cannot be applied: {1}".format(
+                    path or '/', reason))
+
+        keys = []
+        seen = set()
+        for idx, item in enumerate(items):
+            if not isinstance(item, MutableMapping):
+                return fail("element at index {0} is not an object".format(idx))
+
+            if key_field not in item:
+                return fail("element at index {0} has no key field '{1}'".format(
+                    idx, key_field))
+
+            value = item[key_field]
+            if not isinstance(value, (basestring, int, float, bool, type(None))):
+                return fail("key '{0}' of element at index {1} is not a "
+                            "JSON scalar".format(key_field, idx))
+
+            typed_key = (value, type(value))
+            if typed_key in seen:
+                return fail("duplicate key {0!r} for field '{1}'".format(
+                    value, key_field))
+
+            seen.add(typed_key)
+            keys.append(typed_key)
+
+        return keys
+
+    def _compare_lists_by_key(self, path, src, dst, key_field):
+        """Diffs two arrays whose object elements are identified by the
+        unique value of ``key_field``. Emits remove/move/add operations for
+        the array itself and recurses into matched elements, tracking the
+        current index of every element as operations are generated."""
+        src_keys = self._extract_array_keys(path, src, key_field)
+        dst_keys = self._extract_array_keys(path, dst, key_field)
+        if src_keys is None or dst_keys is None:
+            # fallback requested by the caller: use the positional algorithm
+            self._compare_lists(path, src, dst)
+            return
+
+        src_by_key = dict(zip(src_keys, src))
+        dst_by_key = dict(zip(dst_keys, dst))
+        src_key_set = set(src_keys)
+        dst_key_set = set(dst_keys)
+
+        # 1. patch the inside of matched elements first; no operation
+        #    emitted here changes the length of this array, so all paths
+        #    still refer to valid source indices
+        for idx, typed_key in enumerate(src_keys):
+            if typed_key in dst_key_set:
+                self._compare_values(path, idx,
+                                     src_by_key[typed_key],
+                                     dst_by_key[typed_key])
+
+        # 2. remove elements that are gone, highest index first so that
+        #    lower indices stay valid
+        current = list(src_keys)
+        for idx in range(len(current) - 1, -1, -1):
+            if current[idx] not in dst_key_set:
+                self.insert(RemoveOperation({
+                    'op': 'remove',
+                    'path': _path_join(path, idx),
+                }, pointer_cls=self.pointer_cls))
+                del current[idx]
+
+        # 3. walk the target order left to right, moving matched elements
+        #    into place and inserting new ones. Once a position is fixed,
+        #    later operations only touch higher indices.
+        for idx, typed_key in enumerate(dst_keys):
+            if typed_key not in src_key_set:
+                self.insert(AddOperation({
+                    'op': 'add',
+                    'path': _path_join(path, idx),
+                    'value': dst_by_key[typed_key],
+                }, pointer_cls=self.pointer_cls))
+                current.insert(idx, typed_key)
+                continue
+
+            cur_idx = current.index(typed_key)
+            if cur_idx != idx:
+                self.insert(MoveOperation({
+                    'op': 'move',
+                    'from': _path_join(path, cur_idx),
+                    'path': _path_join(path, idx),
+                }, pointer_cls=self.pointer_cls))
+                current.insert(idx, current.pop(cur_idx))
+
     def _compare_values(self, path, key, src, dst):
         if isinstance(src, MutableMapping) and \
                 isinstance(dst, MutableMapping):
@@ -908,7 +1054,12 @@ class DiffBuilder(object):
 
         elif isinstance(src, MutableSequence) and \
                 isinstance(dst, MutableSequence):
-            self._compare_lists(_path_join(path, key), src, dst)
+            new_path = _path_join(path, key)
+            key_field = self.array_keys.get(new_path)
+            if key_field is not None:
+                self._compare_lists_by_key(new_path, src, dst, key_field)
+            else:
+                self._compare_lists(new_path, src, dst)
 
         # To ensure we catch changes to JSON, we can't rely on a simple
         # src == dst, because it would not recognize the difference between

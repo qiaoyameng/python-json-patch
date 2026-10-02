@@ -4,6 +4,7 @@
 from __future__ import unicode_literals
 
 import json
+import copy
 import decimal
 import doctest
 import unittest
@@ -890,6 +891,177 @@ class UtilityMethodTests(unittest.TestCase):
             jsonpatch.CopyOperation({'path': '/target', 'from': '/source'}).apply({})
 
 
+class RebaseTests(unittest.TestCase):
+
+    def test_rebase_independent_object_fields(self):
+        base = {'name': 'old', 'meta': {'keep': True}, 'arr': [1, 2]}
+        applied = [
+            {'op': 'replace', 'path': '/name', 'value': 'applied'},
+            {'op': 'add', 'path': '/meta/applied', 'value': 1},
+        ]
+        pending = [
+            {'op': 'add', 'path': '/meta/pending', 'value': 2},
+            {'op': 'replace', 'path': '/arr/1', 'value': 3},
+        ]
+
+        base_copy = copy.deepcopy(base)
+        applied_copy = copy.deepcopy(applied)
+        pending_copy = copy.deepcopy(pending)
+        result = jsonpatch.rebase(base, applied, pending)
+
+        self.assertEqual(result, result.patch)
+        self.assertEqual(result.conflicts, [])
+        self.assertEqual(result.patch, [
+            {'op': 'add', 'path': '/meta/pending', 'value': 2},
+            {'op': 'replace', 'path': '/arr/1', 'value': 3},
+        ])
+        merged = result.apply(jsonpatch.apply_patch(base, applied))
+        self.assertEqual(merged, {
+            'name': 'applied',
+            'meta': {'keep': True, 'applied': 1, 'pending': 2},
+            'arr': [1, 3],
+        })
+        self.assertEqual(base, base_copy)
+        self.assertEqual(applied, applied_copy)
+        self.assertEqual(pending, pending_copy)
+
+    def test_rebase_independent_array_elements_and_gap_order(self):
+        base = {'items': ['a', 'b', 'c']}
+        applied = [
+            {'op': 'add', 'path': '/items/1', 'value': 'applied'},
+            {'op': 'replace', 'path': '/items/3', 'value': 'C'},
+        ]
+        pending = [
+            {'op': 'remove', 'path': '/items/1'},
+            {'op': 'add', 'path': '/items/2', 'value': 'pending'},
+        ]
+
+        result = jsonpatch.rebase(base, applied, pending)
+
+        self.assertEqual(result.conflicts, [])
+        self.assertEqual(result.patch, [
+            {'op': 'remove', 'path': '/items/2'},
+            {'op': 'add', 'path': '/items/3', 'value': 'pending'},
+        ])
+        merged = result.apply(jsonpatch.apply_patch(base, applied))
+        self.assertEqual(merged, {
+            'items': ['a', 'applied', 'C', 'pending']})
+
+    def test_rebase_cross_array_move_transforms_from_and_path(self):
+        base = {'source': ['a', 'b', 'c'], 'target': ['x'], 'meta': 1}
+        applied = [
+            {'op': 'add', 'path': '/source/1', 'value': 'inserted'},
+            {'op': 'add', 'path': '/target/1', 'value': 'y'},
+            {'op': 'replace', 'path': '/meta', 'value': 2},
+        ]
+        pending = [
+            {'op': 'move', 'from': '/source/1', 'path': '/target/1'},
+        ]
+
+        result = jsonpatch.rebase(base, applied, pending)
+        self.assertEqual(result.conflicts, [])
+        self.assertEqual(result.patch, [
+            {'op': 'move', 'from': '/source/2', 'path': '/target/2'},
+        ])
+        merged = result.apply(jsonpatch.apply_patch(base, applied))
+        self.assertEqual(merged, {
+            'source': ['a', 'inserted', 'c'],
+            'target': ['x', 'y', 'b'],
+            'meta': 2,
+        })
+
+    def test_rebase_same_array_move_and_gap_order(self):
+        base = {'items': ['a', 'b', 'c', 'd']}
+        applied = [
+            {'op': 'add', 'path': '/items/1', 'value': 'applied'},
+            {'op': 'move', 'from': '/items/3', 'path': '/items/1'},
+        ]
+        pending = [
+            {'op': 'add', 'path': '/items/1', 'value': 'pending'},
+        ]
+
+        result = jsonpatch.rebase(base, applied, pending)
+
+        self.assertEqual(result.conflicts, [])
+        self.assertEqual(result.patch, [
+            {'op': 'add', 'path': '/items/3', 'value': 'pending'},
+        ])
+        merged = result.apply(jsonpatch.apply_patch(base, applied))
+        self.assertEqual(merged, {
+            'items': ['a', 'c', 'applied', 'pending', 'b', 'd']})
+
+    def test_rebase_test_precondition_conflict(self):
+        base = {'checked': False}
+        applied = [{'op': 'replace', 'path': '/checked', 'value': True}]
+        pending = [
+            {'op': 'test', 'path': '/checked', 'value': False},
+            {'op': 'replace', 'path': '/checked', 'value': 'maybe'},
+        ]
+
+        result = jsonpatch.rebase(base, applied, pending)
+
+        self.assertEqual(result.patch, [])
+        self.assertEqual(len(result.conflicts), 2)
+        self.assertEqual([c['operation_index'] for c in result.conflicts],
+                         [0, 1])
+        self.assertEqual([c['path'] for c in result.conflicts],
+                         ['/checked', '/checked'])
+        self.assertEqual(result.conflicts[0]['reason'],
+                         'test_precondition_failed')
+        self.assertEqual(result.conflicts[1]['reason'],
+                         'same_scalar_modified')
+
+    def test_rebase_cross_array_move_conflict(self):
+        base = {'source': [1], 'first': [], 'second': []}
+        applied = [{'op': 'move', 'from': '/source/0',
+                    'path': '/first/0'}]
+        pending = [{'op': 'move', 'from': '/source/0',
+                    'path': '/second/0'}]
+
+        result = jsonpatch.rebase(base, applied, pending)
+
+        self.assertEqual(result.patch, [])
+        self.assertEqual(len(result.conflicts), 1)
+        conflict = result.conflicts[0]
+        self.assertEqual(conflict['operation_index'], 0)
+        self.assertEqual(conflict['path'], '/second/0')
+        self.assertEqual(conflict['from'], '/source/0')
+        self.assertEqual(conflict['operation']['path'], '/second/0')
+        self.assertEqual(conflict['reason'], 'move_source_moved')
+        self.assertEqual(conflict['applied_operation_indexes'], [0])
+
+    def test_rebase_structured_conflicts_include_index_and_location(self):
+        base = {
+            'a~b': 1,
+            'container': {'child': {'value': 1}},
+            'rooted': True,
+        }
+        applied = [
+            {'op': 'replace', 'path': '/a~0b', 'value': 2},
+            {'op': 'remove', 'path': '/container/child'},
+            {'op': 'replace', 'path': '', 'value': {'rooted': False}},
+        ]
+        pending = [
+            {'op': 'replace', 'path': '/a~0b', 'value': 3},
+            {'op': 'replace', 'path': '/container/child/value', 'value': 2},
+            {'op': 'replace', 'path': '/rooted', 'value': 'changed'},
+        ]
+
+        result = jsonpatch.rebase(base, applied, pending)
+        conflicts = result.conflicts
+
+        self.assertEqual(result.patch, [])
+        self.assertEqual([c['operation_index'] for c in conflicts], [0, 1, 2])
+        self.assertEqual([c['path'] for c in conflicts], [
+            '/a~0b', '/container/child/value', '/rooted'])
+        self.assertEqual(conflicts[0]['reason'], 'same_scalar_modified')
+        self.assertEqual(conflicts[1]['reason'], 'ancestor_removed')
+        self.assertEqual(conflicts[2]['reason'], 'ancestor_removed')
+        self.assertEqual(conflicts[0]['applied_operation_indexes'], [0])
+        self.assertEqual(conflicts[1]['applied_operation_indexes'], [1])
+        self.assertEqual(conflicts[2]['applied_operation_indexes'], [2])
+
+
 class CustomJsonPointer(jsonpointer.JsonPointer):
     pass
 
@@ -1058,6 +1230,7 @@ if __name__ == '__main__':
         suite.addTest(unittest.makeSuite(JsonPointerTests))
         suite.addTest(unittest.makeSuite(JsonPatchCreationTest))
         suite.addTest(unittest.makeSuite(UtilityMethodTests))
+        suite.addTest(unittest.makeSuite(RebaseTests))
         suite.addTest(unittest.makeSuite(CustomJsonPointerTests))
         suite.addTest(unittest.makeSuite(CustomOperationTests))
         return suite

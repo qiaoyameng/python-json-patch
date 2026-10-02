@@ -7,6 +7,7 @@ import json
 import decimal
 import doctest
 import unittest
+import copy
 import jsonpatch
 import jsonpointer
 import sys
@@ -747,6 +748,148 @@ class InvalidInputTests(unittest.TestCase):
         self.assertRaises(jsonpatch.JsonPatchException, jsonpatch.apply_patch, src, patch_obj)
 
 
+class RebaseTests(unittest.TestCase):
+
+    def assert_rebase_preserves_intent(self, base, applied, pending, expected):
+        base_before = copy.deepcopy(base)
+        applied_before = copy.deepcopy(applied)
+        pending_before = copy.deepcopy(pending)
+
+        result = jsonpatch.rebase(base, applied, pending)
+
+        self.assertEqual(base, base_before)
+        self.assertEqual(applied, applied_before)
+        self.assertEqual(pending, pending_before)
+
+        applied_doc = jsonpatch.apply_patch(base, applied)
+        result_doc = jsonpatch.apply_patch(applied_doc, result['patch'])
+        self.assertEqual(result_doc, expected)
+        self.assertEqual(result['conflicts'], [])
+
+    def test_independent_object_fields(self):
+        base = {'a': 1, 'b': 2, 'c': {'d': 3}}
+        applied = [{'op': 'replace', 'path': '/a', 'value': 10}]
+        pending = [
+            {'op': 'replace', 'path': '/b', 'value': 20},
+            {'op': 'add', 'path': '/c/e', 'value': 30},
+        ]
+        self.assert_rebase_preserves_intent(
+            base, applied, pending,
+            {'a': 10, 'b': 20, 'c': {'d': 3, 'e': 30}})
+
+    def test_independent_array_elements_and_same_gap_order(self):
+        base = {'xs': [
+            {'id': 1, 'v': 'one'},
+            {'id': 2, 'v': 'two'},
+            {'id': 3, 'v': 'three'},
+        ]}
+        applied = [
+            {'op': 'add', 'path': '/xs/1', 'value': {'id': 'applied'}},
+            {'op': 'remove', 'path': '/xs/0'},
+        ]
+        pending = [
+            {'op': 'add', 'path': '/xs/1', 'value': {'id': 'pending'}},
+            {'op': 'replace', 'path': '/xs/2/v', 'value': 'TWO'},
+        ]
+        result = jsonpatch.rebase(base, applied, pending)
+        self.assertEqual(result['patch'][0], {
+            'op': 'add',
+            'path': '/xs/1',
+            'value': {'id': 'pending'},
+        })
+        self.assert_rebase_preserves_intent(
+            base, applied, pending,
+            {'xs': [
+                {'id': 'applied'},
+                {'id': 'pending'},
+                {'id': 2, 'v': 'TWO'},
+                {'id': 3, 'v': 'three'},
+            ]})
+
+    def test_cross_array_move_transforms_from_and_path(self):
+        base = {'a': [1, 2, 3], 'b': [4]}
+        applied = [{'op': 'move', 'from': '/a/1', 'path': '/b/1'}]
+        pending = [{'op': 'move', 'from': '/a/2', 'path': '/b/-'}]
+
+        result = jsonpatch.rebase(base, applied, pending)
+        self.assertEqual(result['conflicts'], [])
+        self.assertEqual(result['patch'][0]['from'], '/a/1')
+        self.assertEqual(result['patch'][0]['path'], '/b/2')
+
+        applied_doc = jsonpatch.apply_patch(base, applied)
+        result_doc = jsonpatch.apply_patch(applied_doc, result['patch'])
+        self.assertEqual(result_doc, {'a': [1], 'b': [4, 2, 3]})
+
+    def test_escaped_key_same_scalar_conflict(self):
+        base = {'a/b': {'c~d': 1}}
+        applied = [{'op': 'replace', 'path': '/a~1b/c~0d', 'value': 2}]
+        pending = [{'op': 'replace', 'path': '/a~1b/c~0d', 'value': 3}]
+
+        result = jsonpatch.rebase(base, applied, pending)
+        self.assertEqual(result['patch'], [])
+        self.assertEqual(result['conflicts'], [{
+            'operation_index': 0,
+            'op': 'replace',
+            'reason': 'same_scalar_written',
+            'path': '/a~1b/c~0d',
+            'applied_operation_index': 0,
+        }])
+
+    def test_root_replacement_conflict(self):
+        base = {'old': 1}
+        applied = [{'op': 'replace', 'path': '', 'value': {'new': 2}}]
+        pending = [
+            {'op': 'replace', 'path': '/old', 'value': 3},
+            {'op': 'add', 'path': '/another', 'value': 4},
+        ]
+
+        result = jsonpatch.rebase(base, applied, pending)
+        self.assertEqual(result['patch'], [])
+        self.assertEqual(
+            [conflict['operation_index'] for conflict in result['conflicts']],
+            [0, 1])
+        self.assertTrue(all(
+            conflict['applied_operation_index'] == 0
+            for conflict in result['conflicts']))
+
+    def test_removed_ancestor_and_broken_test_conflicts(self):
+        base = {'parent': {'child': 1}, 'checked': 1}
+        applied = [
+            {'op': 'remove', 'path': '/parent'},
+            {'op': 'replace', 'path': '/checked', 'value': 2},
+        ]
+        pending = [
+            {'op': 'replace', 'path': '/parent/child', 'value': 2},
+            {'op': 'test', 'path': '/checked', 'value': 1},
+        ]
+
+        result = jsonpatch.rebase(base, applied, pending)
+        self.assertEqual(result['patch'], [])
+        self.assertEqual(result['conflicts'][0], {
+            'operation_index': 0,
+            'op': 'replace',
+            'reason': 'ancestor_removed',
+            'path': '/parent/child',
+            'applied_operation_index': 0,
+        })
+        self.assertEqual(result['conflicts'][1]['operation_index'], 1)
+        self.assertEqual(result['conflicts'][1]['reason'],
+                         'test_premise_changed')
+        self.assertEqual(result['conflicts'][1]['path'], '/checked')
+
+    def test_same_node_moved_twice_conflict(self):
+        base = {'a': [1, 2], 'b': [], 'c': []}
+        applied = [{'op': 'move', 'from': '/a/1', 'path': '/b/-'}]
+        pending = [{'op': 'move', 'from': '/a/1', 'path': '/c/-'}]
+
+        result = jsonpatch.rebase(base, applied, pending)
+        self.assertEqual(result['patch'], [])
+        self.assertEqual(result['conflicts'][0]['operation_index'], 0)
+        self.assertEqual(result['conflicts'][0]['reason'],
+                         'moved_node_moved')
+        self.assertEqual(result['conflicts'][0]['from'], '/b/0')
+
+
 class ConflictTests(unittest.TestCase):
 
     def test_remove_indexerror(self):
@@ -1053,6 +1196,7 @@ if __name__ == '__main__':
         suite.addTest(unittest.makeSuite(MakePatchTestCase))
         suite.addTest(unittest.makeSuite(ListTests))
         suite.addTest(unittest.makeSuite(InvalidInputTests))
+        suite.addTest(unittest.makeSuite(RebaseTests))
         suite.addTest(unittest.makeSuite(ConflictTests))
         suite.addTest(unittest.makeSuite(OptimizationTests))
         suite.addTest(unittest.makeSuite(JsonPointerTests))

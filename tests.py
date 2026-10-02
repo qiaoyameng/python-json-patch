@@ -4,6 +4,7 @@
 from __future__ import unicode_literals
 
 import json
+import copy
 import decimal
 import doctest
 import unittest
@@ -108,6 +109,232 @@ class ApplyPatchTestCase(unittest.TestCase):
         new_obj = {'baz': 'qux'}
         res = jsonpatch.apply_patch(obj, [{'op': 'add', 'path': '', 'value': new_obj}])
         self.assertTrue(res, new_obj)
+
+    def test_root_add_and_replace_all_json_types(self):
+        values = [
+            {'object': {'nested': []}},
+            ['array', 1],
+            'string',
+            42,
+            3.14,
+            True,
+            False,
+            None,
+        ]
+
+        for op in ('add', 'replace'):
+            for value in values:
+                original = {'old': []}
+                patch = [{'op': op, 'path': '', 'value': value}]
+
+                result = jsonpatch.apply_patch(original, patch)
+                self.assertEqual(result, value)
+                self.assertEqual(original, {'old': []})
+
+                original = {'old': []}
+                result = jsonpatch.apply_patch(original, patch, in_place=True)
+                self.assertEqual(result, value)
+                self.assertEqual(original, {'old': []})
+
+    def test_root_test_all_json_types_and_boolean_types(self):
+        values = [
+            {'object': {'nested': []}},
+            ['array', 1],
+            'string',
+            42,
+            3.14,
+            True,
+            False,
+            None,
+        ]
+
+        for value in values:
+            jsonpatch.apply_patch(value, [{'op': 'test', 'path': '', 'value': value}])
+
+        for actual, compared in ((True, 1), (False, 0), (1, True), (0, False)):
+            self.assertRaises(
+                jsonpatch.JsonPatchTestFailed,
+                jsonpatch.apply_patch,
+                actual,
+                [{'op': 'test', 'path': '', 'value': compared}],
+            )
+
+    def test_root_copy_does_not_share_containers(self):
+        doc = {'items': [{'name': 'original'}]}
+        patch = [{'op': 'copy', 'from': '', 'path': '/copy'}]
+
+        result = jsonpatch.apply_patch(doc, patch)
+        self.assertEqual(result, {
+            'items': [{'name': 'original'}],
+            'copy': {'items': [{'name': 'original'}]},
+        })
+        result['copy']['items'][0]['name'] = 'changed'
+        self.assertEqual(doc, {'items': [{'name': 'original'}]})
+
+        result = jsonpatch.apply_patch(doc, patch, in_place=True)
+        self.assertIs(result, doc)
+        result['copy']['items'][0]['name'] = 'changed'
+        self.assertEqual(doc['items'], [{'name': 'original'}])
+
+    def test_copy_root_to_same_path_returns_a_copy(self):
+        for doc in (
+            {'items': [{'name': 'original'}]},
+            [1, 2],
+            'string',
+            42,
+            3.14,
+            True,
+            False,
+            None,
+        ):
+            patch = [{'op': 'copy', 'from': '', 'path': ''}]
+
+            result = jsonpatch.apply_patch(doc, patch)
+            self.assertEqual(result, doc)
+            if isinstance(doc, (dict, list)):
+                self.assertIsNot(result, doc)
+
+            result = jsonpatch.apply_patch(doc, patch, in_place=True)
+            self.assertEqual(result, doc)
+            if isinstance(doc, (dict, list)):
+                self.assertIsNot(result, doc)
+
+        doc = {'items': [{'name': 'original'}]}
+        patch = [{'op': 'copy', 'from': '', 'path': ''}]
+        result = jsonpatch.apply_patch(doc, patch, in_place=True)
+        result['items'][0]['name'] = 'changed'
+        self.assertEqual(doc, {'items': [{'name': 'original'}]})
+
+    def test_copy_current_root_into_array(self):
+        doc = [1]
+        patch = [{'op': 'copy', 'from': '', 'path': '/-'}]
+        result = jsonpatch.apply_patch(doc, patch, in_place=True)
+        self.assertEqual(result, [1, [1]])
+        result[1].append(2)
+        self.assertEqual(result, [1, [1, 2]])
+
+    def test_move_root_to_same_path_is_noop(self):
+        for doc in ({'name': 'value'}, [1, 2], 'string', 3, True, None):
+            patch = [{'op': 'move', 'from': '', 'path': ''}]
+            result = jsonpatch.apply_patch(doc, patch, in_place=True)
+            self.assertIs(result, doc)
+
+            result = jsonpatch.apply_patch(doc, patch)
+            self.assertEqual(result, doc)
+            if isinstance(doc, (dict, list)):
+                self.assertIsNot(result, doc)
+
+    def test_move_root_into_descendant_is_rejected_before_mutation(self):
+        patch = [{'op': 'move', 'from': '', 'path': '/child'}]
+
+        doc = {'other': []}
+        self.assertRaises(jsonpatch.JsonPatchConflict,
+                          jsonpatch.apply_patch, doc, patch)
+        self.assertEqual(doc, {'other': []})
+
+        doc = [1]
+        self.assertRaises(jsonpatch.JsonPatchConflict,
+                          jsonpatch.apply_patch, doc, patch, True)
+        self.assertEqual(doc, [1])
+
+        doc = [1]
+        array_patch = [{'op': 'move', 'from': '', 'path': '/-'}]
+        self.assertRaises(jsonpatch.JsonPatchConflict,
+                          jsonpatch.apply_patch, doc, array_patch, True)
+        self.assertEqual(doc, [1])
+
+    def test_empty_from_errors_are_patch_conflicts(self):
+        scalar_doc = 'root'
+        self.assertRaises(
+            jsonpatch.JsonPatchConflict,
+            jsonpatch.apply_patch,
+            scalar_doc,
+            [{'op': 'move', 'from': '', 'path': '/child'}],
+        )
+        self.assertEqual(scalar_doc, 'root')
+
+    def test_move_member_to_root(self):
+        child = {'nested': {'name': 'child'}}
+        doc = {'child': child}
+        patch = [{'op': 'move', 'from': '/child', 'path': ''}]
+
+        result = jsonpatch.apply_patch(doc, patch)
+        self.assertEqual(result, child)
+        self.assertIsNot(result, child)
+        result['nested']['name'] = 'changed'
+        self.assertEqual(child['nested']['name'], 'child')
+        self.assertEqual(set(doc.keys()), {'child'})
+
+        result = jsonpatch.apply_patch(doc, patch, in_place=True)
+        self.assertIs(result, child)
+        self.assertEqual(doc, {})
+
+    def test_pointer_empty_key_and_escaped_tokens(self):
+        doc = {
+            '': {'a/b': 1, 'a~b': 2, '': 3},
+            'a/b': 4,
+        }
+        patch = [
+            {'op': 'test', 'path': '', 'value': doc},
+            {'op': 'test', 'path': '/', 'value': {'a/b': 1, 'a~b': 2, '': 3}},
+            {'op': 'test', 'path': '//a~1b', 'value': 1},
+            {'op': 'test', 'path': '//a~0b', 'value': 2},
+            {'op': 'test', 'path': '//', 'value': 3},
+            {'op': 'test', 'path': '/a~1b', 'value': 4},
+        ]
+        jsonpatch.apply_patch(doc, patch)
+
+    def test_equal_from_and_path_semantics(self):
+        doc = {'value': {'name': 'original'}}
+        patch = [{'op': 'copy', 'from': '/value', 'path': '/value'}]
+        result = jsonpatch.apply_patch(doc, patch, in_place=True)
+        self.assertEqual(result, doc)
+        result['value']['name'] = 'changed'
+        self.assertEqual(doc, {'value': {'name': 'changed'}})
+
+        doc = [{'name': 'original'}, 'second']
+        patch = [{'op': 'copy', 'from': '/0', 'path': '/0'}]
+        result = jsonpatch.apply_patch(doc, patch, in_place=True)
+        self.assertEqual(result, [{'name': 'original'}, {'name': 'original'}, 'second'])
+        result[0]['name'] = 'changed'
+        self.assertEqual(result[1]['name'], 'original')
+
+        doc = [1, 2, 3, 4]
+        patch = [{'op': 'move', 'from': '/0', 'path': '/0'}]
+        result = jsonpatch.apply_patch(doc, patch, in_place=True)
+        self.assertEqual(result, [1, 2, 3, 4])
+
+    def test_consecutive_operations_change_root_type(self):
+        original = {}
+        patch = [
+            {'op': 'add', 'path': '', 'value': []},
+            {'op': 'add', 'path': '/-', 'value': {'items': [{'k': 1}]}},
+            {'op': 'copy', 'from': '/0/items/0', 'path': '/0/copy'},
+            {'op': 'add', 'path': '/0/copy/new', 'value': 2},
+            {'op': 'test', 'path': '', 'value': [
+                {'items': [{'k': 1}], 'copy': {'k': 1, 'new': 2}},
+            ]},
+            {'op': 'replace', 'path': '', 'value': {'ok': True}},
+            {'op': 'test', 'path': '', 'value': {'ok': True}},
+            {'op': 'replace', 'path': '', 'value': 'text'},
+            {'op': 'test', 'path': '', 'value': 'text'},
+            {'op': 'replace', 'path': '', 'value': 42},
+            {'op': 'test', 'path': '', 'value': 42},
+            {'op': 'replace', 'path': '', 'value': False},
+            {'op': 'test', 'path': '', 'value': False},
+            {'op': 'replace', 'path': '', 'value': None},
+            {'op': 'test', 'path': '', 'value': None},
+        ]
+        inplace_patch = copy.deepcopy(patch)
+
+        copy_original = dict(original)
+        result = jsonpatch.apply_patch(copy_original, patch)
+        self.assertIsNone(result)
+        self.assertEqual(copy_original, {})
+
+        result = jsonpatch.apply_patch(original, inplace_patch, in_place=True)
+        self.assertIsNone(result)
+        self.assertEqual(original, {})
 
     def test_replace_array_item(self):
         obj = {'foo': ['bar', 'qux', 'baz']}

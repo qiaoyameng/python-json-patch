@@ -6,6 +6,7 @@ from __future__ import unicode_literals
 import json
 import decimal
 import doctest
+import random
 import unittest
 import jsonpatch
 import jsonpointer
@@ -248,6 +249,282 @@ class ApplyPatchTestCase(unittest.TestCase):
         self.assertRaises(jsonpatch.InvalidJsonPatch,
                           jsonpatch.apply_patch,
                           obj, '[{"op": "add", "path": null, "value": "bar"}]')
+
+
+class ApplyWithInverseTestCase(unittest.TestCase):
+
+    def assertRoundTrip(self, doc, patch):
+        result, inverse = jsonpatch.apply_with_inverse(doc, patch)
+        restored = jsonpatch.apply_patch(result, inverse)
+        self.assertEqual(restored, doc)
+        return result, inverse
+
+    def test_add_new_object_key(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': 'bar'},
+            [{'op': 'add', 'path': '/baz', 'value': 'qux'}])
+        self.assertEqual(inverse, [{'op': 'remove', 'path': '/baz'}])
+
+    def test_add_overwrites_object_key(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': 'bar'},
+            [{'op': 'add', 'path': '/foo', 'value': 'qux'}])
+        self.assertEqual(inverse,
+                         [{'op': 'replace', 'path': '/foo', 'value': 'bar'}])
+
+    def test_add_array_item(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': ['bar', 'baz']},
+            [{'op': 'add', 'path': '/foo/1', 'value': 'qux'}])
+        self.assertEqual(inverse, [{'op': 'remove', 'path': '/foo/1'}])
+
+    def test_add_array_end_resolves_dash(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': ['bar', 'baz']},
+            [{'op': 'add', 'path': '/foo/-', 'value': 'qux'}])
+        self.assertEqual(inverse, [{'op': 'remove', 'path': '/foo/2'}])
+
+    def test_remove_object_key(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': 'bar', 'baz': 'qux'},
+            [{'op': 'remove', 'path': '/baz'}])
+        self.assertEqual(inverse,
+                         [{'op': 'add', 'path': '/baz', 'value': 'qux'}])
+
+    def test_remove_array_item(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': ['bar', 'baz']},
+            [{'op': 'remove', 'path': '/foo/0'}])
+        self.assertEqual(inverse,
+                         [{'op': 'add', 'path': '/foo/0', 'value': 'bar'}])
+
+    def test_replace(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': 'bar'},
+            [{'op': 'replace', 'path': '/foo', 'value': 'qux'}])
+        self.assertEqual(inverse,
+                         [{'op': 'replace', 'path': '/foo', 'value': 'bar'}])
+
+    def test_replace_root(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': 'bar'},
+            [{'op': 'replace', 'path': '', 'value': [1, 2]}])
+        self.assertEqual(inverse,
+                         [{'op': 'replace', 'path': '',
+                           'value': {'foo': 'bar'}}])
+
+    def test_add_replaces_root(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': 'bar'},
+            [{'op': 'add', 'path': '', 'value': {'baz': 'qux'}}])
+        self.assertEqual(inverse,
+                         [{'op': 'replace', 'path': '',
+                           'value': {'foo': 'bar'}}])
+
+    def test_move_object_keys(self):
+        self.assertRoundTrip(
+            {'foo': 'bar', 'baz': 'qux'},
+            [{'op': 'move', 'from': '/foo', 'path': '/baz'}])
+
+    def test_move_within_array(self):
+        self.assertRoundTrip(
+            {'foo': [1, 2, 3]},
+            [{'op': 'move', 'from': '/foo/0', 'path': '/foo/2'}])
+        self.assertRoundTrip(
+            {'foo': [1, 2, 3]},
+            [{'op': 'move', 'from': '/foo/2', 'path': '/foo/0'}])
+        self.assertRoundTrip(
+            {'foo': [1, 2, 3]},
+            [{'op': 'move', 'from': '/foo/0', 'path': '/foo/-'}])
+
+    def test_move_to_root(self):
+        self.assertRoundTrip(
+            {'foo': {'bar': 1}, 'baz': 2},
+            [{'op': 'move', 'from': '/foo', 'path': ''}])
+
+    def test_move_noop(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': 'bar'},
+            [{'op': 'move', 'from': '/foo', 'path': '/foo'}])
+        self.assertEqual(inverse, [])
+
+    def test_copy_then_modify_copy(self):
+        self.assertRoundTrip(
+            {'foo': {'bar': 1}},
+            [{'op': 'copy', 'from': '/foo', 'path': '/baz'},
+             {'op': 'replace', 'path': '/baz/bar', 'value': 42}])
+
+    def test_test_operation_has_no_inverse(self):
+        _, inverse = self.assertRoundTrip(
+            {'foo': 'bar'},
+            [{'op': 'test', 'path': '/foo', 'value': 'bar'},
+             {'op': 'replace', 'path': '/foo', 'value': 'qux'}])
+        self.assertEqual(inverse,
+                         [{'op': 'replace', 'path': '/foo', 'value': 'bar'}])
+
+    def test_operation_sequence(self):
+        self.assertRoundTrip(
+            {'foo': 'bar', 'nums': [1, 2, 3]},
+            [{'op': 'add', 'path': '/baz', 'value': {'q': [1]}},
+             {'op': 'replace', 'path': '/foo', 'value': 'BAR'},
+             {'op': 'remove', 'path': '/nums/1'},
+             {'op': 'add', 'path': '/nums/-', 'value': 99},
+             {'op': 'move', 'from': '/baz/q', 'path': '/nums'},
+             {'op': 'copy', 'from': '/nums', 'path': '/backup'},
+             {'op': 'test', 'path': '/backup', 'value': [1]}])
+
+    def test_applies_to_copy_by_default(self):
+        doc = {'foo': 'bar'}
+        result, _ = jsonpatch.apply_with_inverse(
+            doc, [{'op': 'add', 'path': '/baz', 'value': 'qux'}])
+        self.assertEqual(doc, {'foo': 'bar'})
+        self.assertEqual(result, {'foo': 'bar', 'baz': 'qux'})
+
+    def test_in_place(self):
+        doc = {'foo': 'bar'}
+        result, inverse = jsonpatch.apply_with_inverse(
+            doc, [{'op': 'add', 'path': '/baz', 'value': 'qux'}],
+            in_place=True)
+        self.assertTrue(result is doc)
+        self.assertEqual(jsonpatch.apply_patch(result, inverse),
+                         {'foo': 'bar'})
+
+    def test_from_string(self):
+        result, inverse = jsonpatch.apply_with_inverse(
+            {'foo': 'bar'},
+            '[{"op": "add", "path": "/baz", "value": "qux"}]')
+        self.assertEqual(jsonpatch.apply_patch(result, inverse),
+                         {'foo': 'bar'})
+
+    def test_failure_returns_no_partial_inverse(self):
+        doc = {'foo': 'bar'}
+        self.assertRaises(jsonpatch.JsonPatchException,
+                          jsonpatch.apply_with_inverse,
+                          doc,
+                          [{'op': 'add', 'path': '/baz', 'value': 'qux'},
+                           {'op': 'remove', 'path': '/missing'}])
+        self.assertEqual(doc, {'foo': 'bar'})
+
+    def test_inverse_isolated_from_result(self):
+        doc = {'foo': {'bar': [1, 2]}}
+        result, inverse = jsonpatch.apply_with_inverse(
+            doc, [{'op': 'move', 'from': '/foo', 'path': '/baz'}])
+        # mutating the moved value inside the result must not corrupt
+        # the value stored in the inverse patch
+        result['baz']['bar'].append(99)
+        restored = jsonpatch.apply_patch(result, inverse)
+        self.assertEqual(restored['foo'], {'bar': [1, 2]})
+
+    def test_inverse_isolated_from_patch(self):
+        doc = {'foo': 'bar'}
+        patch = [{'op': 'replace', 'path': '/foo', 'value': {'x': 1}}]
+        result, inverse = jsonpatch.apply_with_inverse(doc, patch)
+        patch[0]['value']['x'] = 999
+        patch[0]['path'] = '/elsewhere'
+        self.assertEqual(jsonpatch.apply_patch(result, inverse), doc)
+
+    def test_random_roundtrip(self):
+        rng = random.Random(6902)
+        for _ in range(200):
+            doc = _random_json(rng)
+            patch = _random_patch(doc, rng)
+            result, inverse = jsonpatch.apply_with_inverse(doc, patch)
+            restored = jsonpatch.apply_patch(result, inverse)
+            self.assertEqual(restored, doc)
+
+
+def _random_json(rng, depth=0):
+    if depth >= 3:
+        kind = 'scalar'
+    else:
+        kind = rng.choice(('scalar', 'scalar', 'dict', 'list'))
+    if kind == 'dict':
+        return {'k%d' % i: _random_json(rng, depth + 1)
+                for i in range(rng.randint(0, 3))}
+    if kind == 'list':
+        return [_random_json(rng, depth + 1)
+                for _ in range(rng.randint(0, 3))]
+    return rng.choice([1, 2.5, 's', True, False, None])
+
+
+def _random_locations(doc):
+    """Collects (parent_path, key, container) for every member of doc."""
+    found = []
+
+    def walk(node, path):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                found.append((path, key, node))
+                walk(value, path + '/' + str(key))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                found.append((path, index, node))
+                walk(value, path + '/' + str(index))
+
+    walk(doc, '')
+    return found
+
+
+def _random_add_target(doc, rng):
+    """Picks a random path usable as an add/move/copy target."""
+    if not isinstance(doc, (dict, list)):
+        # only the root itself can be addressed
+        return ''
+    targets = [('', doc)]
+    for parent, key, container in _random_locations(doc):
+        value = container[key]
+        if isinstance(value, (dict, list)):
+            targets.append((parent + '/' + str(key), value))
+    path, target = rng.choice(targets)
+    if isinstance(target, dict):
+        return path + '/new%d' % rng.randint(0, 3)
+    index = rng.randint(0, len(target))
+    if index == len(target) and rng.random() < 0.5:
+        return path + '/-'
+    return path + '/%d' % index
+
+
+def _random_op(doc, rng):
+    locations = _random_locations(doc)
+    op_kind = rng.choice(['add', 'remove', 'replace', 'move', 'copy', 'test'])
+
+    if op_kind == 'add' or not locations:
+        return {'op': 'add', 'path': _random_add_target(doc, rng),
+                'value': _random_json(rng)}
+
+    parent, key, container = rng.choice(locations)
+    path = parent + '/' + str(key)
+
+    if op_kind == 'remove':
+        return {'op': 'remove', 'path': path}
+
+    if op_kind == 'replace':
+        return {'op': 'replace', 'path': path, 'value': _random_json(rng)}
+
+    if op_kind == 'test':
+        return {'op': 'test', 'path': path, 'value': container[key]}
+
+    return {'op': op_kind, 'from': path,
+            'path': _random_add_target(doc, rng)}
+
+
+def _random_patch(doc, rng):
+    """Builds a random sequence of valid operations covering all op kinds,
+    tracking the document state after each step."""
+    patch = []
+    current = doc
+    for _ in range(rng.randint(1, 8)):
+        op = _random_op(current, rng)
+        try:
+            current = jsonpatch.apply_patch(current, [op])
+        except (jsonpatch.JsonPatchException,
+                jsonpatch.JsonPointerException, TypeError):
+            # the library raises TypeError or JsonPointerException for
+            # some invalid operations (e.g. replacing the root of a
+            # non-container document or moving a list into itself)
+            continue
+        patch.append(op)
+    return patch
 
 
 class EqualityTestCase(unittest.TestCase):
@@ -1049,6 +1326,7 @@ if __name__ == '__main__':
         suite = unittest.TestSuite()
         suite.addTest(doctest.DocTestSuite(jsonpatch))
         suite.addTest(unittest.makeSuite(ApplyPatchTestCase))
+        suite.addTest(unittest.makeSuite(ApplyWithInverseTestCase))
         suite.addTest(unittest.makeSuite(EqualityTestCase))
         suite.addTest(unittest.makeSuite(MakePatchTestCase))
         suite.addTest(unittest.makeSuite(ListTests))

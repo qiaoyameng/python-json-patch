@@ -157,6 +157,46 @@ def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer):
     return patch.apply(doc, in_place)
 
 
+def apply_with_inverse(doc, patch, in_place=False, pointer_cls=JsonPointer):
+    """Apply list of patches to specified json document and return both the
+    patched document and an inverse patch that undoes the change.
+
+    :param doc: Document object.
+    :type doc: dict
+
+    :param patch: JSON patch as list of dicts or raw JSON-encoded string.
+    :type patch: list or str
+
+    :param in_place: While :const:`True` patch will modify target document.
+                     By default patch will be applied to document copy.
+    :type in_place: bool
+
+    :param pointer_cls: JSON pointer class to use.
+    :type pointer_cls: Type[JsonPointer]
+
+    :return: Tuple of the patched document and the inverse patch as a plain
+             list of RFC 6902 operations. The inverse patch is generated from
+             the document state at each step and can be fed back to
+             :func:`apply_patch`. If any operation fails, an exception is
+             raised and no (partial) inverse patch is returned.
+    :rtype: tuple
+
+    >>> doc = {'foo': 'bar'}
+    >>> patch = [{'op': 'add', 'path': '/baz', 'value': 'qux'}]
+    >>> result, inverse = apply_with_inverse(doc, patch)
+    >>> result == {'foo': 'bar', 'baz': 'qux'}
+    True
+    >>> apply_patch(result, inverse) == doc
+    True
+    """
+
+    if isinstance(patch, basestring):
+        patch = JsonPatch.from_string(patch, pointer_cls=pointer_cls)
+    else:
+        patch = JsonPatch(patch, pointer_cls=pointer_cls)
+    return patch.apply_with_inverse(doc, in_place=in_place)
+
+
 def make_patch(src, dst, pointer_cls=JsonPointer):
     """Generates patch by comparing two document objects. Actually is
     a proxy to :meth:`JsonPatch.from_diff` method.
@@ -501,6 +541,136 @@ class CopyOperation(PatchOperation):
         return obj
 
 
+def _parent_path(pointer):
+    """Returns the escaped JSON pointer of the parent of ``pointer``."""
+    if len(pointer.parts) <= 1:
+        return ''
+    return JsonPointer.from_parts(pointer.parts[:-1]).path
+
+
+def _undo_add(pointer, location, doc):
+    """Inverse operations for an 'add' (or the add-half of move/copy) at
+    ``location``, computed against the document state the add sees."""
+    subobj, part = pointer.to_last(doc)
+
+    if part is None:
+        # the whole document is replaced
+        return [{'op': 'replace', 'path': '', 'value': copy.deepcopy(doc)}]
+
+    if isinstance(subobj, MutableSequence):
+        # resolve a trailing '-' to the concrete position the element
+        # will occupy after the add
+        index = len(subobj) if part == '-' else part
+        path = _parent_path(pointer) + '/' + str(index)
+        return [{'op': 'remove', 'path': path}]
+
+    if isinstance(subobj, MutableMapping):
+        if part in subobj:
+            # the add overwrites an existing member, restore the old value
+            return [{'op': 'replace', 'path': location,
+                     'value': copy.deepcopy(subobj[part])}]
+        return [{'op': 'remove', 'path': location}]
+
+    # apply() will raise for anything else
+    return []
+
+
+def _undo_remove(operation, doc):
+    subobj, part = operation.pointer.to_last(doc)
+    if part is None:
+        # removing the root is not supported, apply() will fail
+        return []
+    try:
+        old = copy.deepcopy(subobj[part])
+    except (KeyError, IndexError, TypeError):
+        # the target does not exist, apply() will raise the conflict
+        return []
+    return [{'op': 'add', 'path': operation.location, 'value': old}]
+
+
+def _undo_replace(operation, doc):
+    subobj, part = operation.pointer.to_last(doc)
+    if part is None:
+        # the whole document is replaced
+        return [{'op': 'replace', 'path': '', 'value': copy.deepcopy(doc)}]
+    try:
+        old = copy.deepcopy(subobj[part])
+    except (KeyError, IndexError, TypeError):
+        # the target does not exist, apply() will raise the conflict
+        return []
+    return [{'op': 'replace', 'path': operation.location, 'value': old}]
+
+
+def _undo_move(operation, doc, pointer_cls):
+    try:
+        from_location = operation.operation['from']
+    except KeyError:
+        # apply() will raise InvalidJsonPatch
+        return []
+
+    from_ptr = pointer_cls(from_location)
+
+    # a move to the same location is a no-op
+    if from_ptr == operation.pointer:
+        return []
+
+    subobj, part = from_ptr.to_last(doc)
+    try:
+        value = copy.deepcopy(subobj[part])
+    except (KeyError, IndexError, TypeError):
+        # the source does not exist, apply() will raise the conflict
+        return []
+
+    # simulate the removal so the inverse of the add-half (including
+    # overwritten targets and '-' resolution) reflects the document
+    # state the add actually sees
+    try:
+        scratch = copy.deepcopy(doc)
+        RemoveOperation({
+            'op': 'remove',
+            'path': from_location,
+        }, pointer_cls=pointer_cls).apply(scratch)
+        undo_add = _undo_add(operation.pointer, operation.location, scratch)
+    except (JsonPointerException, JsonPatchException):
+        # let apply() raise the canonical error
+        return []
+
+    undo_remove = {'op': 'add', 'path': from_location, 'value': value}
+    return undo_add + [undo_remove]
+
+
+def _inverse_operations(operation, doc, pointer_cls):
+    """Returns the list of RFC 6902 operations (in application order) that
+    undo a single ``operation`` applied to ``doc``. Values captured from the
+    document are deep-copied so later mutations of the document, the result
+    or the original patch cannot corrupt the inverse patch."""
+    try:
+        if isinstance(operation, TestOperation):
+            # a test never modifies the document
+            return []
+
+        if isinstance(operation, RemoveOperation):
+            return _undo_remove(operation, doc)
+
+        if isinstance(operation, AddOperation):
+            return _undo_add(operation.pointer, operation.location, doc)
+
+        if isinstance(operation, ReplaceOperation):
+            return _undo_replace(operation, doc)
+
+        if isinstance(operation, MoveOperation):
+            return _undo_move(operation, doc, pointer_cls)
+
+        if isinstance(operation, CopyOperation):
+            return _undo_add(operation.pointer, operation.location, doc)
+
+    except JsonPointerException:
+        # let operation.apply() raise the canonical error
+        return []
+
+    return []
+
+
 class JsonPatch(object):
     json_dumper = staticmethod(json.dumps)
     json_loader = staticmethod(_jsonloads)
@@ -692,6 +862,40 @@ class JsonPatch(object):
             obj = operation.apply(obj)
 
         return obj
+
+    def apply_with_inverse(self, obj, in_place=False):
+        """Applies the patch to a given object and returns both the modified
+        object and an inverse patch that restores the original document.
+
+        :param obj: Document object.
+        :type obj: dict
+
+        :param in_place: Tweaks the way how patch would be applied - directly to
+                         specified `obj` or to its copy.
+        :type in_place: bool
+
+        :return: Tuple of modified `obj` and the inverse patch as a plain list
+                 of RFC 6902 operations. The inverse of each operation is
+                 derived from the document state right before that operation
+                 is applied. If any operation fails, the exception is
+                 propagated and no (partial) inverse patch is returned.
+        :rtype: tuple
+        """
+
+        if not in_place:
+            obj = copy.deepcopy(obj)
+
+        undo_groups = []
+        for operation in self._ops:
+            undo_groups.append(
+                _inverse_operations(operation, obj, self.pointer_cls))
+            obj = operation.apply(obj)
+
+        inverse = []
+        for group in reversed(undo_groups):
+            inverse.extend(group)
+
+        return obj, inverse
 
     def _get_operation(self, operation):
         if 'op' not in operation:

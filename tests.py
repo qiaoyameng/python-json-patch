@@ -597,6 +597,173 @@ class MakePatchTestCase(unittest.TestCase):
         self.assertEqual(new, new_from_patch)
 
 
+class MakePatchArrayKeysTestCase(unittest.TestCase):
+
+    def test_swap_with_field_change(self):
+        src = {'lines': [
+            {'line_id': 'a', 'qty': 1, 'payload': 'x' * 1000},
+            {'line_id': 'b', 'qty': 2, 'payload': 'y' * 1000},
+        ]}
+        dst = {'lines': [
+            {'line_id': 'b', 'qty': 5, 'payload': 'y' * 1000},
+            {'line_id': 'a', 'qty': 1, 'payload': 'x' * 1000},
+        ]}
+        patch = jsonpatch.make_patch(src, dst, array_keys={'/lines': 'line_id'})
+        res = patch.apply(src)
+        self.assertEqual(res, dst)
+        ops = patch.patch
+        # the reorder is a move, the field change a local replace
+        self.assertIn({'op': 'move', 'from': '/lines/1', 'path': '/lines/0'}, ops)
+        self.assertIn({'op': 'replace', 'path': '/lines/1/qty', 'value': 5}, ops)
+        self.assertEqual(len(ops), 2)
+        # unchanged large fields are not rewritten as whole objects
+        for op in ops:
+            if 'value' in op:
+                self.assertNotIsInstance(op['value'], dict)
+
+    def test_head_tail_insert_remove(self):
+        src = {'items': [
+            {'id': 'a', 'v': 1},
+            {'id': 'b', 'v': 2},
+            {'id': 'c', 'v': 3},
+        ]}
+        dst = {'items': [
+            {'id': 'h', 'v': 0},
+            {'id': 'b', 'v': 2},
+            {'id': 'c', 'v': 3},
+            {'id': 't', 'v': 4},
+        ]}
+        patch = jsonpatch.make_patch(src, dst, array_keys={'/items': 'id'})
+        res = patch.apply(src)
+        self.assertEqual(res, dst)
+        ops = patch.patch
+        # 'a' is replaced by 'h' at the head, 't' appended at the tail,
+        # 'b' and 'c' are not touched at all
+        self.assertEqual(ops, [
+            {'op': 'replace', 'path': '/items/0', 'value': {'id': 'h', 'v': 0}},
+            {'op': 'add', 'path': '/items/3', 'value': {'id': 't', 'v': 4}},
+        ])
+
+    def test_nested_keyed_arrays(self):
+        src = {'orders': [
+            {'order_id': 'o1', 'lines': [
+                {'line_id': 'l1', 'qty': 1},
+                {'line_id': 'l2', 'qty': 2},
+            ]},
+            {'order_id': 'o2', 'lines': [
+                {'line_id': 'l3', 'qty': 3},
+            ]},
+        ]}
+        dst = {'orders': [
+            {'order_id': 'o2', 'lines': [
+                {'line_id': 'l3', 'qty': 3},
+            ]},
+            {'order_id': 'o1', 'lines': [
+                {'line_id': 'l2', 'qty': 9},
+                {'line_id': 'l1', 'qty': 1},
+            ]},
+        ]}
+        array_keys = {
+            '/orders': 'order_id',
+            '/orders/0/lines': 'line_id',
+            '/orders/1/lines': 'line_id',
+        }
+        patch = jsonpatch.make_patch(src, dst, array_keys=array_keys)
+        res = patch.apply(src)
+        self.assertEqual(res, dst)
+        ops = patch.patch
+        self.assertIn({'op': 'replace', 'path': '/orders/0/lines/1/qty',
+                       'value': 9}, ops)
+        self.assertIn({'op': 'move', 'from': '/orders/0/lines/1',
+                       'path': '/orders/0/lines/0'}, ops)
+        self.assertIn({'op': 'move', 'from': '/orders/1',
+                       'path': '/orders/0'}, ops)
+        self.assertEqual(len(ops), 3)
+
+    def test_root_array(self):
+        src = [{'id': 'a', 'v': 1}, {'id': 'b', 'v': 2}]
+        dst = [{'id': 'b', 'v': 2}, {'id': 'a', 'v': 1}]
+        patch = jsonpatch.make_patch(src, dst, array_keys={'': 'id'})
+        res = patch.apply(src)
+        self.assertEqual(res, dst)
+        self.assertEqual(patch.patch,
+                         [{'op': 'move', 'from': '/1', 'path': '/0'}])
+
+    def test_added_element_carries_full_object(self):
+        new_item = {'line_id': 'b', 'qty': 2, 'payload': 'z' * 1000}
+        src = {'lines': [{'line_id': 'a', 'qty': 1}]}
+        dst = {'lines': [{'line_id': 'a', 'qty': 1}, new_item]}
+        patch = jsonpatch.make_patch(src, dst, array_keys={'/lines': 'line_id'})
+        self.assertEqual(patch.patch, [
+            {'op': 'add', 'path': '/lines/1', 'value': new_item},
+        ])
+        res = patch.apply(src)
+        self.assertEqual(res, dst)
+
+    def test_missing_key_raises(self):
+        src = {'lines': [{'line_id': 'a'}, {'other': 1}]}
+        dst = {'lines': [{'line_id': 'a'}]}
+        with self.assertRaises(jsonpatch.ArrayKeyError):
+            jsonpatch.make_patch(src, dst, array_keys={'/lines': 'line_id'})
+
+    def test_duplicate_key_raises(self):
+        src = {'lines': [{'line_id': 'a'}, {'line_id': 'a'}]}
+        dst = {'lines': [{'line_id': 'a'}]}
+        with self.assertRaises(jsonpatch.ArrayKeyError):
+            jsonpatch.make_patch(src, dst, array_keys={'/lines': 'line_id'})
+
+    def test_non_object_item_raises(self):
+        src = {'lines': [{'line_id': 'a'}, 42]}
+        dst = {'lines': [{'line_id': 'a'}]}
+        with self.assertRaises(jsonpatch.ArrayKeyError):
+            jsonpatch.make_patch(src, dst, array_keys={'/lines': 'line_id'})
+
+    def test_non_scalar_key_raises(self):
+        src = {'lines': [{'line_id': ['a']}]}
+        dst = {'lines': []}
+        with self.assertRaises(jsonpatch.ArrayKeyError):
+            jsonpatch.make_patch(src, dst, array_keys={'/lines': 'line_id'})
+
+    def test_fallback_on_missing_key(self):
+        src = {'lines': [{'line_id': 'a', 'v': 1}, {'other': 2}]}
+        dst = {'lines': [{'line_id': 'a', 'v': 1}, {'other': 3}]}
+        patch = jsonpatch.make_patch(src, dst,
+                                     array_keys={'/lines': 'line_id'},
+                                     on_key_error='fallback')
+        res = patch.apply(src)
+        self.assertEqual(res, dst)
+
+    def test_fallback_on_duplicate_key(self):
+        src = {'lines': [{'line_id': 'a', 'v': 1}, {'line_id': 'a', 'v': 2}]}
+        dst = {'lines': [{'line_id': 'a', 'v': 1}, {'line_id': 'a', 'v': 3}]}
+        patch = jsonpatch.make_patch(src, dst,
+                                     array_keys={'/lines': 'line_id'},
+                                     on_key_error='fallback')
+        res = patch.apply(src)
+        self.assertEqual(res, dst)
+
+    def test_invalid_on_key_error(self):
+        with self.assertRaises(ValueError):
+            jsonpatch.make_patch({'a': []}, {'a': []},
+                                 array_keys={'/a': 'id'},
+                                 on_key_error='bogus')
+
+    def test_invalid_array_keys(self):
+        with self.assertRaises(ValueError):
+            jsonpatch.make_patch({'a': []}, {'a': []}, array_keys={'/a': 42})
+
+    def test_unspecified_arrays_keep_old_behavior(self):
+        src = {'lines': [{'line_id': 'a', 'qty': 1},
+                         {'line_id': 'b', 'qty': 2}]}
+        dst = {'lines': [{'line_id': 'b', 'qty': 2},
+                         {'line_id': 'a', 'qty': 1}]}
+        patch = jsonpatch.make_patch(src, dst)
+        res = patch.apply(src)
+        self.assertEqual(res, dst)
+        # without identity rules there is no move of whole elements
+        self.assertNotIn('move', [op['op'] for op in patch.patch])
+
+
 class OptimizationTests(unittest.TestCase):
     def test_use_replace_instead_of_remove_add(self):
         src = {'foo': [1, 2, 3]}
@@ -1051,6 +1218,7 @@ if __name__ == '__main__':
         suite.addTest(unittest.makeSuite(ApplyPatchTestCase))
         suite.addTest(unittest.makeSuite(EqualityTestCase))
         suite.addTest(unittest.makeSuite(MakePatchTestCase))
+        suite.addTest(unittest.makeSuite(MakePatchArrayKeysTestCase))
         suite.addTest(unittest.makeSuite(ListTests))
         suite.addTest(unittest.makeSuite(InvalidInputTests))
         suite.addTest(unittest.makeSuite(ConflictTests))

@@ -98,6 +98,24 @@ class JsonPatchTestFailed(JsonPatchException, AssertionError):
     """ A Test operation failed """
 
 
+class JsonPatchAccessDenied(JsonPatchException):
+    """Raised when a patch operation violates an :class:`AccessPolicy`.
+
+    Carries only the operation position and the required permission;
+    document values are never included, so sensitive subtree content
+    cannot leak through the exception message.
+    """
+
+    def __init__(self, index, op, path, permission):
+        self.index = index
+        self.op = op
+        self.path = path
+        self.permission = permission
+        msg = "operation {0} ({1}) requires {2} access to {3!r}".format(
+            index, op, permission, path)
+        super(JsonPatchAccessDenied, self).__init__(msg)
+
+
 def multidict(ordered_pairs):
     """Convert duplicate keys values to lists."""
     # read all values into lists
@@ -117,7 +135,8 @@ def multidict(ordered_pairs):
 _jsonloads = functools.partial(json.loads, object_pairs_hook=multidict)
 
 
-def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer):
+def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer,
+                policy=None):
     """Apply list of patches to specified json document.
 
     :param doc: Document object.
@@ -132,6 +151,10 @@ def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer):
 
     :param pointer_cls: JSON pointer class to use.
     :type pointer_cls: Type[JsonPointer]
+
+    :param policy: Optional :class:`AccessPolicy` the patch is checked
+                   against while being applied.
+    :type policy: AccessPolicy
 
     :return: Patched document object.
     :rtype: dict
@@ -154,7 +177,7 @@ def apply_patch(doc, patch, in_place=False, pointer_cls=JsonPointer):
         patch = JsonPatch.from_string(patch, pointer_cls=pointer_cls)
     else:
         patch = JsonPatch(patch, pointer_cls=pointer_cls)
-    return patch.apply(doc, in_place)
+    return patch.apply(doc, in_place, policy=policy)
 
 
 def make_patch(src, dst, pointer_cls=JsonPointer):
@@ -205,6 +228,27 @@ class PatchOperation(object):
     def apply(self, obj):
         """Abstract method that applies a patch operation to the specified object."""
         raise NotImplementedError('should implement the patch operation.')
+
+    def required_access(self):
+        """Returns ``(location, parts, permission)`` tuples this operation needs.
+
+        ``parts`` are the parsed JSON pointer segments of the affected
+        location and ``permission`` is either ``'read'`` or ``'write'``.
+        """
+        return [(self.location, tuple(self.pointer.parts), 'write')]
+
+    def _from_pointer(self):
+        try:
+            from_loc = self.operation['from']
+        except KeyError as ex:
+            raise InvalidJsonPatch(
+                "The operation does not contain a 'from' member")
+        if isinstance(from_loc, self.pointer_cls):
+            return from_loc
+        try:
+            return self.pointer_cls(from_loc)
+        except TypeError as ex:
+            raise InvalidJsonPatch("Invalid 'from'")
 
     def __hash__(self):
         return hash(frozenset(self.operation.items()))
@@ -366,6 +410,17 @@ class ReplaceOperation(PatchOperation):
 class MoveOperation(PatchOperation):
     """Moves an object property or an array element to a new location."""
 
+    def required_access(self):
+        from_ptr = self._from_pointer()
+        from_loc = self.operation['from']
+        if isinstance(from_loc, self.pointer_cls):
+            from_loc = from_loc.path
+        return [
+            (from_loc, tuple(from_ptr.parts), 'read'),
+            (from_loc, tuple(from_ptr.parts), 'write'),
+            (self.location, tuple(self.pointer.parts), 'write'),
+        ]
+
     def apply(self, obj):
         try:
             if isinstance(self.operation['from'], self.pointer_cls):
@@ -452,6 +507,9 @@ class MoveOperation(PatchOperation):
 class TestOperation(PatchOperation):
     """Test value by specified location."""
 
+    def required_access(self):
+        return [(self.location, tuple(self.pointer.parts), 'read')]
+
     def apply(self, obj):
         try:
             subobj, part = self.pointer.to_last(obj)
@@ -479,6 +537,16 @@ class TestOperation(PatchOperation):
 class CopyOperation(PatchOperation):
     """ Copies an object property or an array element to a new location """
 
+    def required_access(self):
+        from_ptr = self._from_pointer()
+        from_loc = self.operation['from']
+        if isinstance(from_loc, self.pointer_cls):
+            from_loc = from_loc.path
+        return [
+            (from_loc, tuple(from_ptr.parts), 'read'),
+            (self.location, tuple(self.pointer.parts), 'write'),
+        ]
+
     def apply(self, obj):
         try:
             from_ptr = self.pointer_cls(self.operation['from'])
@@ -499,6 +567,71 @@ class CopyOperation(PatchOperation):
         }, pointer_cls=self.pointer_cls).apply(obj)
 
         return obj
+
+
+class AccessPolicy(object):
+    """Optional read/write scope policy for JSON Patch operations.
+
+    Each scope is a JSON pointer that grants access to the location it
+    references and everything below it. Scopes are parsed before being
+    compared, so the root pointer, empty keys, ``~0``/``~1`` escapes and
+    array indices are matched against the real document structure and
+    never by raw string prefix (e.g. scope ``/foo`` does not cover
+    ``/foobar`` and scope ``/list/1`` does not cover ``/list/10``).
+
+    - ``test`` and ``copy`` require *read* access to their source
+    - ``move`` requires *read* and *write* access to its source and
+      *write* access to its target
+    - ``add``, ``remove`` and ``replace`` require *write* access to
+      their target
+
+    Because scopes are prefix sets, replacing or removing an ancestor of
+    a protected location is denied unless the ancestor itself is covered
+    by a write scope, so protected descendants cannot be bypassed.
+
+    :param read: Iterable of read scopes (pointer strings,
+                 :class:`JsonPointer` instances or part sequences).
+    :param write: Iterable of write scopes, same format as `read`.
+    :param pointer_cls: JSON pointer class to use.
+    """
+
+    def __init__(self, read=None, write=None, pointer_cls=JsonPointer):
+        self.pointer_cls = pointer_cls
+        self.read_scopes = frozenset(
+            self._scope_parts(scope) for scope in (read or ()))
+        self.write_scopes = frozenset(
+            self._scope_parts(scope) for scope in (write or ()))
+
+    def _scope_parts(self, scope):
+        if isinstance(scope, self.pointer_cls):
+            return tuple(scope.parts)
+        if isinstance(scope, basestring):
+            return tuple(self.pointer_cls(scope).parts)
+        return tuple(scope)
+
+    def allows(self, parts, permission):
+        """Tells whether `parts` is covered by a scope of `permission`."""
+        scopes = self.read_scopes if permission == 'read' \
+            else self.write_scopes
+        parts = tuple(parts)
+        return any(parts[:len(scope)] == scope for scope in scopes)
+
+    def check_operation(self, operation, index=None):
+        """Checks a single operation against this policy.
+
+        Raises :class:`JsonPatchAccessDenied` if the operation requires
+        access this policy does not grant. Returns :const:`True` when
+        the operation is allowed.
+        """
+        for location, parts, permission in operation.required_access():
+            if not self.allows(parts, permission):
+                raise JsonPatchAccessDenied(
+                    index=index,
+                    op=operation.operation.get('op'),
+                    path=location,
+                    permission=permission,
+                )
+        return True
 
 
 class JsonPatch(object):
@@ -672,7 +805,7 @@ class JsonPatch(object):
     def _ops(self):
         return tuple(map(self._get_operation, self.patch))
 
-    def apply(self, obj, in_place=False):
+    def apply(self, obj, in_place=False, policy=None):
         """Applies the patch to a given object.
 
         :param obj: Document object.
@@ -682,16 +815,50 @@ class JsonPatch(object):
                          specified `obj` or to its copy.
         :type in_place: bool
 
+        :param policy: Optional :class:`AccessPolicy`. When given, every
+                       operation is checked against the policy right
+                       before it is executed; the first violation raises
+                       :class:`JsonPatchAccessDenied`. Use :meth:`check`
+                       beforehand for an all-or-nothing preflight when
+                       applying `in_place`.
+        :type policy: AccessPolicy
+
         :return: Modified `obj`.
         """
 
         if not in_place:
             obj = copy.deepcopy(obj)
 
-        for operation in self._ops:
+        for index, operation in enumerate(self._ops):
+            if policy is not None:
+                policy.check_operation(operation, index)
             obj = operation.apply(obj)
 
         return obj
+
+    def check(self, obj, policy):
+        """Preflight-checks the whole patch against an :class:`AccessPolicy`.
+
+        Operations are validated one by one against a copy of `obj`, so
+        structural changes made by preceding operations (such as array
+        index shifts after an insert) are taken into account, while
+        `obj` itself is never modified.
+
+        Raises :class:`JsonPatchAccessDenied` for the first operation
+        that violates the policy; other failures (conflicts, invalid
+        pointers) are raised just as they would be during :meth:`apply`.
+
+        :return: :const:`True` if the whole patch is allowed and
+                 applicable.
+        """
+
+        obj = copy.deepcopy(obj)
+
+        for index, operation in enumerate(self._ops):
+            policy.check_operation(operation, index)
+            obj = operation.apply(obj)
+
+        return True
 
     def _get_operation(self, operation):
         if 'op' not in operation:

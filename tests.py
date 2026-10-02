@@ -1041,6 +1041,328 @@ class CustomOperationTests(unittest.TestCase):
         self.assertEqual(res, {})
 
 
+class AccessPolicyTests(unittest.TestCase):
+
+    def make_policy(self, read=(), write=()):
+        return jsonpatch.AccessPolicy(read=read, write=write)
+
+    def test_copy_from_protected_source_denied(self):
+        doc = {'profile': {'public': {'name': 'ann'}},
+               'secrets': {'token': 's3cr3t'}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'copy', 'from': '/secrets/token',
+             'path': '/profile/public/token'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            patch.apply(doc, policy=policy)
+        exc = cm.exception
+        self.assertEqual(exc.index, 0)
+        self.assertEqual(exc.op, 'copy')
+        self.assertEqual(exc.permission, 'read')
+        self.assertEqual(exc.path, '/secrets/token')
+        # the sensitive value must not leak into the exception
+        self.assertNotIn('s3cr3t', str(exc))
+        self.assertEqual(doc, {'profile': {'public': {'name': 'ann'}},
+                               'secrets': {'token': 's3cr3t'}})
+
+    def test_copy_within_scope_allowed(self):
+        doc = {'profile': {'public': {'name': 'ann'}}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'copy', 'from': '/profile/public/name',
+             'path': '/profile/public/nick'},
+        ])
+        res = patch.apply(doc, policy=policy)
+        self.assertEqual(res['profile']['public']['nick'], 'ann')
+
+    def test_copy_to_protected_target_denied(self):
+        doc = {'profile': {'public': {'name': 'ann'}}, 'private': {}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'copy', 'from': '/profile/public/name',
+             'path': '/private/name'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            patch.apply(doc, policy=policy)
+        self.assertEqual(cm.exception.permission, 'write')
+        self.assertEqual(cm.exception.path, '/private/name')
+
+    def test_move_source_requires_read_and_write(self):
+        doc = {'profile': {'public': {}}, 'other': {'b': 2}}
+        # source is readable but not writable
+        policy = self.make_policy(read=['/profile/public', '/other'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'move', 'from': '/other/b',
+             'path': '/profile/public/b'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            patch.apply(doc, policy=policy)
+        self.assertEqual(cm.exception.permission, 'write')
+        self.assertEqual(cm.exception.path, '/other/b')
+
+    def test_move_source_requires_read(self):
+        doc = {'profile': {'public': {}}, 'other': {'b': 2}}
+        # source is writable but not readable
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public', '/other'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'move', 'from': '/other/b',
+             'path': '/profile/public/b'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            patch.apply(doc, policy=policy)
+        self.assertEqual(cm.exception.permission, 'read')
+        self.assertEqual(cm.exception.path, '/other/b')
+
+    def test_move_target_requires_write(self):
+        doc = {'profile': {'public': {'a': 1}}, 'other': {}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'move', 'from': '/profile/public/a', 'path': '/other/a'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            patch.apply(doc, policy=policy)
+        self.assertEqual(cm.exception.permission, 'write')
+        self.assertEqual(cm.exception.path, '/other/a')
+
+    def test_move_allowed(self):
+        doc = {'profile': {'public': {'a': 1}}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'move', 'from': '/profile/public/a',
+             'path': '/profile/public/b'},
+        ])
+        res = patch.apply(doc, policy=policy)
+        self.assertEqual(res, {'profile': {'public': {'b': 1}}})
+
+    def test_ancestor_replace_cannot_bypass_protected_descendant(self):
+        doc = {'profile': {'public': {'name': 'ann'},
+                           'secret': 's3cr3t'}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '/profile', 'value': {'public': {}}},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            patch.apply(doc, policy=policy)
+        self.assertEqual(cm.exception.permission, 'write')
+        self.assertEqual(cm.exception.path, '/profile')
+        self.assertNotIn('s3cr3t', str(cm.exception))
+        self.assertEqual(doc['profile']['secret'], 's3cr3t')
+
+    def test_ancestor_remove_cannot_bypass_protected_descendant(self):
+        doc = {'profile': {'public': {'name': 'ann'},
+                           'secret': 's3cr3t'}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'remove', 'path': '/profile'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            patch.apply(doc, policy=policy)
+        self.assertEqual(cm.exception.path, '/profile')
+        self.assertEqual(doc['profile']['secret'], 's3cr3t')
+
+    def test_root_pointer_requires_root_scope(self):
+        doc = {'profile': {'public': {'name': 'ann'}}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '', 'value': {}},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+            patch.apply(doc, policy=policy)
+
+        root_policy = self.make_policy(read=[''], write=[''])
+        res = patch.apply(doc, policy=root_policy)
+        self.assertEqual(res, {})
+
+    def test_scope_is_not_a_string_prefix(self):
+        doc = {'foo': {'a': 1}, 'foobar': 2}
+        policy = self.make_policy(read=['/foo'], write=['/foo'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '/foobar', 'value': 3},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+            patch.apply(doc, policy=policy)
+
+    def test_empty_key_scope(self):
+        doc = {'': {'x': 1}}
+        policy = self.make_policy(read=['/'], write=['/'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '//x', 'value': 2},
+        ])
+        res = patch.apply(doc, policy=policy)
+        self.assertEqual(res, {'': {'x': 2}})
+
+    def test_escaped_keys_matched_by_structure(self):
+        doc = {'a/b': {'c~d': 1}, 'a': {'b': 2}}
+        policy = self.make_policy(read=['/a~1b'], write=['/a~1b'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '/a~1b/c~0d', 'value': 5},
+        ])
+        res = patch.apply(doc, policy=policy)
+        self.assertEqual(res['a/b']['c~d'], 5)
+        # '/a/b' addresses nested keys 'a' -> 'b', not the 'a/b' key
+        denied = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '/a/b', 'value': 9},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+            denied.apply(doc, policy=policy)
+
+    def test_array_index_scope_is_exact(self):
+        doc = {'list': ['a', 'b', 'c', 'd', 'e', 'f',
+                        'g', 'h', 'i', 'j', 'k']}
+        policy = self.make_policy(read=['/list/1'], write=['/list/1'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '/list/10', 'value': 'z'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+            patch.apply(doc, policy=policy)
+
+    def test_test_operation_requires_read(self):
+        doc = {'profile': {'public': {'name': 'ann'}},
+               'secrets': {'token': 's3cr3t'}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        denied = jsonpatch.JsonPatch([
+            {'op': 'test', 'path': '/secrets/token', 'value': 's3cr3t'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            denied.apply(doc, policy=policy)
+        self.assertEqual(cm.exception.permission, 'read')
+        self.assertNotIn('s3cr3t', str(cm.exception))
+
+        allowed = jsonpatch.JsonPatch([
+            {'op': 'test', 'path': '/profile/public/name', 'value': 'ann'},
+        ])
+        self.assertTrue(allowed.check(doc, policy))
+
+    def test_add_remove_replace_require_write(self):
+        doc = {'profile': {'public': {'name': 'ann'}}, 'locked': 1}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        for op in ({'op': 'add', 'path': '/locked/x', 'value': 1},
+                   {'op': 'remove', 'path': '/locked'},
+                   {'op': 'replace', 'path': '/locked', 'value': 2}):
+            patch = jsonpatch.JsonPatch([op])
+            with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+                patch.apply(doc, policy=policy)
+
+    def test_array_insert_shifts_indices_for_later_ops(self):
+        doc = {'items': ['a', 'b', 'c']}
+        policy = self.make_policy(read=['/items'],
+                                  write=['/items/0', '/items/2'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'add', 'path': '/items/0', 'value': 'x'},
+            # after the insert, index 2 holds the former index 1 ('b')
+            {'op': 'remove', 'path': '/items/2'},
+        ])
+        self.assertTrue(patch.check(doc, policy))
+        # preflight must not modify the original document
+        self.assertEqual(doc, {'items': ['a', 'b', 'c']})
+        res = patch.apply(doc, policy=policy)
+        self.assertEqual(res['items'], ['x', 'a', 'c'])
+
+    def test_array_insert_out_of_scope_index_denied(self):
+        doc = {'items': ['a', 'b', 'c']}
+        policy = self.make_policy(read=['/items'],
+                                  write=['/items/0', '/items/2'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'add', 'path': '/items/0', 'value': 'x'},
+            {'op': 'remove', 'path': '/items/1'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            patch.check(doc, policy)
+        self.assertEqual(cm.exception.index, 1)
+        self.assertEqual(cm.exception.path, '/items/1')
+        self.assertEqual(doc, {'items': ['a', 'b', 'c']})
+
+    def test_check_simulates_structure_changes(self):
+        doc = {'items': ['a', 'b']}
+        policy = self.make_policy(read=['/items'], write=['/items'])
+        # index 3 only becomes valid after the insert
+        patch = jsonpatch.JsonPatch([
+            {'op': 'add', 'path': '/items/0', 'value': 'x'},
+            {'op': 'replace', 'path': '/items/2', 'value': 'B'},
+        ])
+        self.assertTrue(patch.check(doc, policy))
+        self.assertEqual(doc, {'items': ['a', 'b']})
+        res = patch.apply(doc, policy=policy)
+        self.assertEqual(res['items'], ['x', 'a', 'B'])
+
+        # without the insert the same replace would be a conflict
+        conflicting = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '/items/2', 'value': 'B'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchConflict):
+            conflicting.check(doc, policy)
+
+    def test_check_denial_leaves_document_untouched(self):
+        doc = {'profile': {'public': {'n': 1}},
+               'secrets': {'t': 's3cr3t'}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '/profile/public/n', 'value': 2},
+            {'op': 'copy', 'from': '/secrets/t',
+             'path': '/profile/public/t'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied) as cm:
+            patch.check(doc, policy)
+        self.assertEqual(cm.exception.index, 1)
+        self.assertEqual(cm.exception.permission, 'read')
+        self.assertNotIn('s3cr3t', str(cm.exception))
+        # the allowed first operation must not have leaked through
+        self.assertEqual(doc, {'profile': {'public': {'n': 1}},
+                               'secrets': {'t': 's3cr3t'}})
+
+    def test_apply_denial_leaves_document_untouched(self):
+        doc = {'profile': {'public': {'n': 1}},
+               'secrets': {'t': 's3cr3t'}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        patch = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '/profile/public/n', 'value': 2},
+            {'op': 'copy', 'from': '/secrets/t',
+             'path': '/profile/public/t'},
+        ])
+        with self.assertRaises(jsonpatch.JsonPatchAccessDenied):
+            patch.apply(doc, policy=policy)
+        self.assertEqual(doc, {'profile': {'public': {'n': 1}},
+                               'secrets': {'t': 's3cr3t'}})
+
+    def test_apply_patch_function_accepts_policy(self):
+        doc = {'profile': {'public': {'name': 'ann'}}}
+        policy = self.make_policy(read=['/profile/public'],
+                                  write=['/profile/public'])
+        res = jsonpatch.apply_patch(
+            doc,
+            [{'op': 'add', 'path': '/profile/public/age', 'value': 3}],
+            policy=policy)
+        self.assertEqual(res['profile']['public']['age'], 3)
+
+    def test_policy_accepts_pointers_and_part_sequences(self):
+        doc = {'profile': {'public': {'name': 'ann'}}}
+        policy = jsonpatch.AccessPolicy(
+            read=[jsonpointer.JsonPointer('/profile/public')],
+            write=[('profile', 'public')],
+        )
+        patch = jsonpatch.JsonPatch([
+            {'op': 'replace', 'path': '/profile/public/name',
+             'value': 'bob'},
+        ])
+        res = patch.apply(doc, policy=policy)
+        self.assertEqual(res['profile']['public']['name'], 'bob')
+
+
 if __name__ == '__main__':
     modules = ['jsonpatch']
 
@@ -1060,6 +1382,7 @@ if __name__ == '__main__':
         suite.addTest(unittest.makeSuite(UtilityMethodTests))
         suite.addTest(unittest.makeSuite(CustomJsonPointerTests))
         suite.addTest(unittest.makeSuite(CustomOperationTests))
+        suite.addTest(unittest.makeSuite(AccessPolicyTests))
         return suite
 
 
